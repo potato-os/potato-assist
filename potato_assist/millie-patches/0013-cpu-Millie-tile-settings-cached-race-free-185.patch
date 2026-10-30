@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 23:09:56 +0100
+Subject: [PATCH] cpu: Millie tile settings cached race-free (#185)
+
+Each tile setting was cached in two plain statics written one after the
+other, so a compute thread racing the first read could see the row count set
+and the column count still zero and run 4 x 1 tiles for that matmul. Every
+setting now lives in one atomic word, read whole or not at all.
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 04e9bbe..1481e72 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -11,6 +11,7 @@
+ #include <math.h>
+ #include <string.h>
+ #include <assert.h>
++#include <stdatomic.h>
+ #include <float.h>
+ #include <stdlib.h> // for qsort
+ #include <stdio.h>  // for GGML_ASSERT
+@@ -822,6 +823,19 @@ static void millie_tile_shape(const char * var, int dflt_mr, int dflt_nr, int *
+     }
+ }
+ 
++// Read once per process. Each setting lives in one atomic word (MR * 16 + NR),
++// so a thread racing the first read sees the whole shape or none of it.
++static int millie_shape_once(atomic_int * cache, const char * var, int dflt_mr, int dflt_nr) {
++    int v = atomic_load_explicit(cache, memory_order_relaxed);
++    if (v < 0) {
++        int mr, nr;
++        millie_tile_shape(var, dflt_mr, dflt_nr, &mr, &nr);
++        v = mr*16 + nr;
++        atomic_store_explicit(cache, v, memory_order_relaxed);
++    }
++    return v;
++}
++
+ static inline int millie_fit(int want, int left) {
+     int k = want < left ? want : left;
+     return k >= 8 ? 8 : k >= 4 ? 4 : k >= 2 ? 2 : 1;
+@@ -843,42 +857,38 @@ static void millie_gemm(const millie_tile_fn (*tiles)[8], int MR, int NR, int nb
+ }
+ 
+ int ggml_gemm_q4_sym16k_q8_0_enabled(void) {
+-    static int mr = -1, nr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 8, &mr, &nr);
+-    return mr > 0;
++    static atomic_int shape = -1;
++    return (millie_shape_once(&shape, "MILLIE_TILE_Q4", 4, 8) >> 4) > 0;
+ }
+ 
+ int ggml_gemm_qt_ms32k4_q8_0_enabled(void) {
+-    static int mr = -1, nr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nr);
+-    return mr > 0;
++    static atomic_int shape = -1;
++    return (millie_shape_once(&shape, "MILLIE_TILE_QT", 4, 8) >> 4) > 0;
+ }
+ 
+ void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+-    static int mr = -1, nrr, mr1, nr1;
+-    if (mr < 0) {
+-        millie_tile_shape("MILLIE_TILE_Q4", 4, 8, &mr, &nrr);
+-        // One column is a decoded token: the rows still share the activation
+-        // block, but a narrower tile keeps more of it in registers.
+-        millie_tile_shape("MILLIE_TILE_Q4_N1", 2, 1, &mr1, &nr1);
+-    }
+-    if (nc == 1 && mr1 > 0) {
+-        millie_gemm(millie_tiles_q4, mr1, 1, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
++    static atomic_int shape = -1, shape1 = -1;
++    const int v = millie_shape_once(&shape, "MILLIE_TILE_Q4", 4, 8);
++    // One column is a decoded token: the rows still share the activation
++    // block, but a narrower tile keeps more of it in registers.
++    const int v1 = millie_shape_once(&shape1, "MILLIE_TILE_Q4_N1", 2, 1);
++    if (nc == 1 && (v1 >> 4) > 0) {
++        millie_gemm(millie_tiles_q4, v1 >> 4, 1, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
+         return;
+     }
+-    millie_gemm(millie_tiles_q4, mr, nrr, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
++    millie_gemm(millie_tiles_q4, v >> 4, v & 15, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+ void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+-    static int mr = -1, nrr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nrr);
+-    millie_gemm(millie_tiles_qt, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
++    static atomic_int shape = -1;
++    const int v = millie_shape_once(&shape, "MILLIE_TILE_QT", 4, 8);
++    millie_gemm(millie_tiles_qt, v >> 4, v & 15, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+ void ggml_gemm_qt2_r_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+-    static int mr = -1, nrr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nrr);
+-    millie_gemm(millie_tiles_qt2, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
++    static atomic_int shape = -1;
++    const int v = millie_shape_once(&shape, "MILLIE_TILE_QT", 4, 8);
++    millie_gemm(millie_tiles_qt2, v >> 4, v & 15, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+ // #185: Q4_SYM16K rows interleaved by four (the CPU repack buffer). A block
+@@ -1070,9 +1080,9 @@ void ggml_gemm_q4_sym16k_x4(int64_t n, int64_t nrows, int nc, const void * GGML_
+     typedef void (*tile_fn)(int, const block_q4_sym16k_x4 *, const block_q8_0 * const *, float * const *, int);
+     static const tile_fn tiles[8] = { q4_sym16k_x4_q8_0_tile_1, q4_sym16k_x4_q8_0_tile_2, NULL, q4_sym16k_x4_q8_0_tile_4,
+                                       NULL, NULL, NULL, q4_sym16k_x4_q8_0_tile_8 };
+-    static int mr = -1, NR;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 8, &mr, &NR);
+-    const int nr = mr > 0 ? NR : 1;
++    static atomic_int shape = -1;
++    const int v  = millie_shape_once(&shape, "MILLIE_TILE_Q4", 4, 8);
++    const int nr = (v >> 4) > 0 ? (v & 15) : 1;
+     const int nb = (int) (n / QK4_SYM16K);
+     const block_q8_0 * const * ys = (const block_q8_0 * const *) vy;
+     for (int c = 0; c < nc;) {
+@@ -1085,12 +1095,14 @@ void ggml_gemm_q4_sym16k_x4(int64_t n, int64_t nrows, int nc, const void * GGML_
+ }
+ 
+ int ggml_q4_sym16k_x4_enabled(void) {
+-    static int on = -1;
+-    if (on < 0) {
++    static atomic_int on = -1;
++    int v = atomic_load_explicit(&on, memory_order_relaxed);
++    if (v < 0) {
+         const char * e = getenv("MILLIE_Q4X4");
+-        on = e ? atoi(e) != 0 : 1;
++        v = e ? atoi(e) != 0 : 1;
++        atomic_store_explicit(&on, v, memory_order_relaxed);
+     }
+-    return on;
++    return v;
+ }
+ #endif
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 3b48c34..2ed86d5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1217,12 +1217,14 @@ typedef void (*ggml_gemm_tile_t)(int, int, int, const void *, size_t, const void
+ 
+ // MILLIE_TILE_N1=1 lets the tiles take single-column chunks too (decode).
+ static bool ggml_cpu_gemm_tile_n1(void) {
+-    static int on = -1;
+-    if (on < 0) {
++    static atomic_int on = -1;
++    int v = atomic_load_explicit(&on, memory_order_relaxed);
++    if (v < 0) {
+         const char * e = getenv("MILLIE_TILE_N1");
+-        on = e ? atoi(e) != 0 : 1; // on by default: MILLIE_TILE_Q4_N1 picks the shape
++        v = e ? atoi(e) != 0 : 1; // on by default: MILLIE_TILE_Q4_N1 picks the shape
++        atomic_store_explicit(&on, v, memory_order_relaxed);
+     }
+-    return on;
++    return v;
+ }
+ 
+ static ggml_gemm_tile_t ggml_cpu_gemm_tile(enum ggml_type type, enum ggml_type vec_dot_type, bool single_column) {

@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 21:07:26 +0100
+Subject: [PATCH] cpu: 4x8 tiles and direct expert reads by default (#185)
+
+The 12R's sweep put 4x8 first for both Millie weight types (pp512 18.93 with
+the tiles against 10.82 on the GEMV), and O_DIRECT admissions were +3.6%
+tg128 over buffered reads. Both are now the defaults; MILLIE_TILE_Q4,
+MILLIE_TILE_QT and LLAMA_HOT_DIRECT=0 still override them.
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index d64f3d3..04e9bbe 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -844,20 +844,20 @@ static void millie_gemm(const millie_tile_fn (*tiles)[8], int MR, int NR, int nb
+ 
+ int ggml_gemm_q4_sym16k_q8_0_enabled(void) {
+     static int mr = -1, nr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nr);
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 8, &mr, &nr);
+     return mr > 0;
+ }
+ 
+ int ggml_gemm_qt_ms32k4_q8_0_enabled(void) {
+     static int mr = -1, nr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nr);
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nr);
+     return mr > 0;
+ }
+ 
+ void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+     static int mr = -1, nrr, mr1, nr1;
+     if (mr < 0) {
+-        millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nrr);
++        millie_tile_shape("MILLIE_TILE_Q4", 4, 8, &mr, &nrr);
+         // One column is a decoded token: the rows still share the activation
+         // block, but a narrower tile keeps more of it in registers.
+         millie_tile_shape("MILLIE_TILE_Q4_N1", 2, 1, &mr1, &nr1);
+@@ -871,13 +871,13 @@ void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx,
+ 
+ void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+     static int mr = -1, nrr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nrr);
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nrr);
+     millie_gemm(millie_tiles_qt, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+ void ggml_gemm_qt2_r_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+     static int mr = -1, nrr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nrr);
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 8, &mr, &nrr);
+     millie_gemm(millie_tiles_qt2, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index c2a15ef..82143cf 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -140,9 +140,11 @@ static void hot_parallel_for(size_t count, void * ctx, void (*fn)(void *, size_t
+ 
+ // O_DIRECT needs the offset, the length and the buffer aligned to the logical
+ // block; GGUF tensor data is only 32-byte aligned, so a direct read covers the
+-// enclosing 4 KiB span and the slice is copied out.
++// enclosing 4 KiB span and the slice is copied out. On by default (#185: +3.6%
++// tg128 on the 12R over buffered reads, which also churn the page cache);
++// LLAMA_HOT_DIRECT=0 turns it off.
+ static bool hot_direct_reads() {
+-    static const bool direct = getenv("LLAMA_HOT_DIRECT") && atoi(getenv("LLAMA_HOT_DIRECT")) != 0;
++    static const bool direct = !getenv("LLAMA_HOT_DIRECT") || atoi(getenv("LLAMA_HOT_DIRECT")) != 0;
+     return direct;
+ }
+ 

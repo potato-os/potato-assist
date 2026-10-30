@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:22:15 +0100
+Subject: [PATCH] mtmd: the encoder's CPU weights in the repack buffer, on a
+ caller's threadpool (#198)
+
+On the CPU, clip placed every weight in the default buffer, so the
+backend's interleaved matmuls never ran, and each encode spawned and
+joined its own threads. A weight the CPU device would run from its repack
+buffer now goes there, asked the way llama asks. mtmd_context_params takes
+an optional ggml threadpool that clip's CPU backend then runs on: the
+caller's pinned pool instead of fresh, unplaced threads.
+---
+ tools/mtmd/clip.cpp | 72 ++++++++++++++++++++++++++++++++++++++++++++-
+ tools/mtmd/clip.h   |  1 +
+ tools/mtmd/mtmd.cpp |  2 ++
+ tools/mtmd/mtmd.h   |  4 +++
+ 4 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 45e3989..289d222 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -153,6 +153,7 @@ struct clip_ctx {
+     ggml_backend_t backend = nullptr;
+     ggml_backend_t backend_cpu = nullptr;
+     ggml_backend_buffer_ptr buf;
++    ggml_backend_buffer_ptr buf_repack; // weights the CPU interleaves (#198)
+ 
+ 
+     int max_nodes = 8192;
+@@ -168,6 +169,16 @@ struct clip_ctx {
+         if (!backend_cpu) {
+             throw std::runtime_error("failed to initialize CPU backend");
+         }
++        if (ctx_params.threadpool) {
++            ggml_backend_dev_t dev = ggml_backend_get_device(backend_cpu);
++            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            using set_threadpool_t = void (*)(ggml_backend_t, ggml_threadpool_t);
++            auto set_threadpool = reg ? (set_threadpool_t)
++                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool") : nullptr;
++            if (set_threadpool) {
++                set_threadpool(backend_cpu, ctx_params.threadpool);
++            }
++        }
+         if (ctx_params.use_gpu) {
+             auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+             if (backend_name != nullptr) {
+@@ -1573,6 +1584,62 @@ struct clip_model_loader {
+         }
+     }
+ 
++    // #198: on the CPU, a weight the CPU backend can interleave for its matmul
++    // (Millie's Q4_SYM16F) is placed in the repack buffer, as llama places a
++    // model's; the tensors allocated here are skipped by the default buffer.
++    // A tensor is chosen by asking the device whether it would run the matmul
++    // from that buffer, so the choice follows the backend's own rule.
++    static void alloc_cpu_repack(clip_ctx & ctx_clip) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend_cpu);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        auto get_extra = reg ? (ggml_backend_dev_get_extra_bufts_t)
++            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
++        ggml_backend_buffer_type_t repack = nullptr;
++        for (ggml_backend_buffer_type_t * b = get_extra ? get_extra(dev) : nullptr; b && *b; ++b) {
++            if (strcmp(ggml_backend_buft_name(*b), "CPU_REPACK") == 0) {
++                repack = *b;
++            }
++        }
++        if (!repack) {
++            return;
++        }
++        ggml_backend_buffer_ptr probe(ggml_backend_buft_alloc_buffer(repack, 0));
++        const size_t align = ggml_backend_buft_get_alignment(repack);
++        std::vector<ggml_tensor *> picked;
++        size_t total = 0;
++        ggml_context * data = ctx_clip.ctx_data.get();
++        for (ggml_tensor * t = ggml_get_first_tensor(data); t; t = ggml_get_next_tensor(data, t)) {
++            if (ggml_n_dims(t) != 2 || t->type == GGML_TYPE_F32) {
++                continue;
++            }
++            ggml_init_params pp = { ggml_tensor_overhead() * 3, nullptr, true };
++            ggml_context_ptr pc(ggml_init(pp));
++            ggml_tensor * w = ggml_dup_tensor(pc.get(), t);
++            w->buffer = probe.get();
++            ggml_tensor * op = ggml_mul_mat(pc.get(), w, ggml_new_tensor_2d(pc.get(), GGML_TYPE_F32, t->ne[0], 1));
++            if (ggml_backend_dev_supports_op(dev, op)) {
++                picked.push_back(t);
++                total += GGML_PAD(ggml_backend_buft_get_alloc_size(repack, t), align);
++            }
++        }
++        if (picked.empty()) {
++            return;
++        }
++        ctx_clip.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack, total));
++        if (!ctx_clip.buf_repack) {
++            throw std::runtime_error("failed to allocate the CPU repack buffer");
++        }
++        ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        char * base = (char *) ggml_backend_buffer_get_base(ctx_clip.buf_repack.get());
++        size_t offset = 0;
++        for (ggml_tensor * t : picked) {
++            ggml_backend_tensor_alloc(ctx_clip.buf_repack.get(), t, base + offset);
++            offset += GGML_PAD(ggml_backend_buft_get_alloc_size(repack, t), align);
++        }
++        LOG_INF("%s: %zu weights interleaved in %s (%.1f MiB)\n", __func__, picked.size(),
++                ggml_backend_buft_name(repack), total / 1024.0 / 1024.0);
++    }
++
+     void load_tensors(clip_ctx & ctx_clip) {
+         auto & model = ctx_clip.model;
+         auto & hparams = model.hparams;
+@@ -2424,6 +2491,9 @@ struct clip_model_loader {
+             std::vector<uint8_t> read_buf;
+ 
+             // alloc memory and offload data
++            if (ctx_clip.backend == ctx_clip.backend_cpu) {
++                alloc_cpu_repack(ctx_clip);
++            }
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+@@ -2438,7 +2508,7 @@ struct clip_model_loader {
+                     throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                 }
+                 size_t num_bytes = ggml_nbytes(cur);
+-                if (ggml_backend_buft_is_host(buft)) {
++                if (ggml_backend_buffer_is_host(cur->buffer)) {
+                     // for the CPU and Metal backend, we can read directly into the tensor
+                     fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                 } else {
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index a859b38..6da1ac6 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -40,6 +40,7 @@ struct clip_context_params {
+     bool warmup;
+     ggml_backend_sched_eval_callback cb_eval;
+     void * cb_eval_user_data;
++    ggml_threadpool_t threadpool; // CPU work runs here when set (#198)
+ };
+ 
+ struct clip_init_result {
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 5990778..4c7d2ed 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -132,6 +132,7 @@ mtmd_context_params mtmd_context_params_default() {
+         /* image_max_tokens  */ -1,
+         /* cb_eval           */ nullptr,
+         /* cb_eval_user_data */ nullptr,
++        /* threadpool        */ nullptr,
+     };
+     return params;
+ }
+@@ -218,6 +219,7 @@ struct mtmd_context {
+             /* warmup            */ ctx_params.warmup,
+             /* cb_eval           */ ctx_params.cb_eval,
+             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
++            /* threadpool        */ ctx_params.threadpool,
+         };
+ 
+         auto res = clip_init(mmproj_fname, ctx_clip_params);
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index e364174..f58c723 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -96,6 +96,10 @@ struct mtmd_context_params {
+     // callback function passed over to mtmd proper
+     ggml_backend_sched_eval_callback cb_eval;
+     void * cb_eval_user_data;
++
++    // the encoder's CPU work runs on this pool when set, n_threads of its
++    // threads, instead of on threads spawned for every encode (#198)
++    ggml_threadpool_t threadpool;
+ };
+ 
+ MTMD_API const char * mtmd_default_marker(void);
+-- 
+2.54.0 (Apple Git-157)
+

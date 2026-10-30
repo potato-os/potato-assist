@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:23:48 +0100
+Subject: [PATCH] hot experts: the prefetcher and its routers only where it
+ runs (#190 review)
+
+The int8 router copies were built, and the prefetcher's three reader
+threads started, on every hot-expert build: Metal and GPU routing
+included, where nothing reads ahead. The routers are now built, and the
+prefetcher touched, only when this build and its settings read ahead
+(the CPU route with split readers, LLAMA_HOT_PREFETCH not 0); teardown
+reports its counters only if it exists.
+
+Mac Metal greedy text unchanged, and no prefetcher starts there.
+
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 8c64bc8..5df6ab9 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -466,6 +466,15 @@ static int hot_prefetch_rank() {
+     return n;
+ }
+ 
++// Whether this build and its settings ever read ahead: the CPU route with the
++// split readers (the same conditions prefetch_target checks per step).
++static bool hot_prefetch_possible() {
++    return hot_prefetch_on() && !gpu_routing && hot_coop_mode() == 2;
++}
++
++// Set once the prefetcher exists, so teardown can report it without starting it.
++static std::atomic<bool> g_hot_prefetch_live{ false };
++
+ struct hot_prefetch_entry {
+     enum { FREE = 0, CLAIMING = 1, READING = 2, READY = 3 };
+     std::atomic<int>          state{ FREE };
+@@ -509,6 +518,7 @@ struct hot_prefetcher {
+     std::atomic<uint64_t> issued{ 0 }, used{ 0 }, ready_at_use{ 0 }, wait_ns{ 0 }, dropped{ 0 };
+ 
+     hot_prefetcher() {
++        g_hot_prefetch_live.store(true, std::memory_order_relaxed);
+         for (int i = 0; i < 3; i++) {
+             threads.emplace_back([this] { read_loop(); });
+         }
+@@ -1226,7 +1236,7 @@ struct llama_hot_cache {
+             auto loads = s.policy.update(selected);
+             if (!batch_union) {
+                 s.owner->load_admissions(s, loads);
+-                if (hot_prefetch_on()) {
++                if (hot_prefetch_possible()) {
+                     hot_prefetch().release(s.layer_index, s.tokens);
+                 }
+             }
+@@ -1472,7 +1482,7 @@ llama_hot_cache * llama_hot_create(const gguf_context * ctx, int layers, int exp
+ }
+ 
+ void llama_hot_free(llama_hot_cache * cache) {
+-    if (hot_prefetch_on()) {
++    if (g_hot_prefetch_live.load(std::memory_order_relaxed)) {
+         auto & p = hot_prefetch();
+         fprintf(stderr, "HOT_PREFETCH issued=%llu used=%llu ready_at_use=%llu wait_ms=%.1f dropped=%llu\n",
+                 (unsigned long long) p.issued.load(), (unsigned long long) p.used.load(), (unsigned long long) p.ready_at_use.load(),
+@@ -1519,6 +1529,10 @@ ggml_tensor * llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_
+     return cache->llama_hot_route(ctx, logits, layer, x);
+ }
+ 
++bool llama_hot_predicts(const llama_hot_cache *) {
++    return hot_prefetch_possible();
++}
++
+ void llama_hot_set_router_data(llama_hot_cache * cache, int layer, const float * data, int64_t n, int64_t rows) {
+     cache->build_q8_router(layer, data, n, rows);
+ }
+@@ -1574,6 +1588,10 @@ ggml_type llama_hot_slot_type(const llama_hot_cache *, ggml_type file_type) {
+     return file_type;
+ }
+ 
++bool llama_hot_predicts(const llama_hot_cache *) {
++    return false;
++}
++
+ void llama_hot_set_router_data(llama_hot_cache *, int, const float *, int64_t, int64_t) {}
+ 
+ ggml_tensor * llama_hot_route(llama_hot_cache *, ggml_context *, ggml_tensor *, int, ggml_tensor *) {
+diff --git a/src/llama-hot-cache.h b/src/llama-hot-cache.h
+index 8efbf75..0cea822 100644
+--- a/src/llama-hot-cache.h
++++ b/src/llama-hot-cache.h
+@@ -20,6 +20,9 @@ ggml_type         llama_hot_slot_type(const llama_hot_cache * cache, ggml_type f
+ // x: the MoE block's input, the vector the router multiplied (#190: the next
+ // layers' routers applied to it predict their experts).
+ ggml_tensor *     llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer, ggml_tensor * x);
++// Whether the runtime reads the next layer's experts ahead, and so wants
++// llama_hot_set_router_data for every layer (#190).
++bool              llama_hot_predicts(const llama_hot_cache * cache);
+ void              llama_hot_set_router_data(llama_hot_cache * cache, int layer, const float * data, int64_t n, int64_t rows);
+ ggml_tensor *     llama_hot_union_weight(llama_hot_cache * cache, ggml_tensor * original, int layer);
+ ggml_tensor *     llama_hot_union_finish(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * cur, int layer);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index bbf91cf..b8d8c09 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -8095,7 +8095,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+             return false;
+         }
+     }
+-    if (hot_cache) {
++    if (hot_cache && llama_hot_predicts(hot_cache)) {
+         // #190: the prefetch predictor's int8 copy of each router, built from
+         // the file whatever buffer the loaded weight lives in
+         for (int il = 0; il < (int) layers.size(); ++il) {

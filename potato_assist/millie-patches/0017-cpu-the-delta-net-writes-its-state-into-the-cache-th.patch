@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:09:03 +0100
+Subject: [PATCH] cpu: the delta-net writes its state into the cache, the copy
+ skipped; concat split by rows (#190)
+
+The CPU counterpart of #185's Metal delta-net write-back. The fused
+GATED_DELTA_NET puts its new recurrent state after its output and the graph
+copies it into the cache, 2 MB per layer for Millie. A per-graph plan finds
+each such copy (a plain F32 copy of exactly that range, nothing between the
+two nodes touching either range, nothing else ever reading the state); the op
+then writes its state straight into the cache, skips its own input copy when
+that is the same place, and the copy node is skipped. VIEW-like nodes read
+nothing themselves, so they don't count as readers. The same values land in
+the same place.
+
+CONCAT split its work over ne2, which is 1 for decode's conv_input, so one
+thread copied 8192 rows while four waited; it now splits over rows.
+
+12R tg128, two interleaved rounds: 13.78 with the write-back off
+(MILLIE_GDN_WB=0), 14.39 on.
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index 5d1ca5f..5b566e9 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -27,6 +27,10 @@ struct ggml_compute_params {
+ 
+     // use reference implementation
+     bool use_ref;
++
++    // #190: GATED_DELTA_NET writes its new state here instead of into its own
++    // result, when the graph's copy of that state into the cache was folded in
++    void * state_dst;
+ };
+ 
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 15504e8..f11791b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -557,6 +557,13 @@ struct ggml_threadpool {
+     uint32_t     poll;        // Polling level (0 - no polling)
+ 
+     enum ggml_status ec;
++
++    // #190: per node of the current graph, where a GATED_DELTA_NET writes its
++    // state (wb_dst) and which cache copies that made redundant (wb_skip)
++    void **      wb_dst;
++    uint8_t *    wb_skip;
++    int          wb_cap;
++    int          wb_nodes;
+ };
+ 
+ // Per-thread state
+@@ -2854,6 +2861,8 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+ 
+     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
+     ggml_aligned_free(threadpool->workers, workers_size);
++    free(threadpool->wb_dst);
++    free(threadpool->wb_skip);
+     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
+ }
+ 
+@@ -3121,6 +3130,120 @@ struct ggml_cplan ggml_graph_plan(
+     return cplan;
+ }
+ 
++// #190: the CPU counterpart of #185's Metal delta-net write-back. The fused
++// GATED_DELTA_NET puts its new recurrent state after its output, and the graph
++// then copies that state into the cache (2 MB per layer for Millie). When the
++// copy is a plain F32 copy of exactly that range, nothing between the two
++// nodes touches either range, and nothing else ever reads the state range, the
++// op writes its state straight into the cache and the copy is skipped. The
++// same values land in the same place.
++static bool ggml_cpu_overlaps(const void * a, size_t na, const void * b, size_t nb) {
++    const char * pa = (const char *) a, * pb = (const char *) b;
++    return pa < pb + nb && pb < pa + na;
++}
++
++// VIEW / RESHAPE / PERMUTE / TRANSPOSE / NONE nodes read and write nothing
++// themselves; their consumers carry the offsets (#185's Metal landmine).
++static bool ggml_cpu_node_touches(const struct ggml_tensor * t, const void * p, size_t n) {
++    if (ggml_op_is_empty(t->op)) {
++        return false;
++    }
++    if (t->data && ggml_cpu_overlaps(t->data, ggml_nbytes(t), p, n)) {
++        return true;
++    }
++    for (int s = 0; s < GGML_MAX_SRC; ++s) {
++        const struct ggml_tensor * src = t->src[s];
++        if (src && src->data && ggml_cpu_overlaps(src->data, ggml_nbytes(src), p, n)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool ggml_cpu_node_reads(const struct ggml_tensor * t, const void * p, size_t n) {
++    if (ggml_op_is_empty(t->op)) {
++        return false;
++    }
++    for (int s = 0; s < GGML_MAX_SRC; ++s) {
++        const struct ggml_tensor * src = t->src[s];
++        if (src && src->data && ggml_cpu_overlaps(src->data, ggml_nbytes(src), p, n)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool ggml_cpu_state_writeback_on(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("MILLIE_GDN_WB");
++        on = e ? atoi(e) != 0 : 1;
++    }
++    return on;
++}
++
++static void ggml_cpu_plan_state_writeback(struct ggml_threadpool * tp, const struct ggml_cgraph * g) {
++    tp->wb_nodes = 0;
++    if (!ggml_cpu_state_writeback_on()) {
++        return;
++    }
++    const int n = g->n_nodes;
++    if (n > tp->wb_cap) {
++        free(tp->wb_dst);
++        free(tp->wb_skip);
++        tp->wb_dst  = (void **) malloc(n * sizeof(void *));
++        tp->wb_skip = (uint8_t *) malloc(n);
++        tp->wb_cap  = n;
++    }
++    memset(tp->wb_dst, 0, n * sizeof(void *));
++    memset(tp->wb_skip, 0, n);
++    tp->wb_nodes = n;
++    for (int i = 0; i < n; ++i) {
++        const struct ggml_tensor * gdn = g->nodes[i];
++        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || !ggml_is_contiguous(gdn)) {
++            continue;
++        }
++        const struct ggml_tensor * v = gdn->src[2];
++        const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
++        const char *  state = (const char *) gdn->data + S_v * H * n_tokens * n_seqs * sizeof(float);
++        const size_t  bytes = S_v * S_v * H * n_seqs * sizeof(float);
++        int j = -1;
++        for (int k = i + 1; k < n && k < i + 64; ++k) {
++            const struct ggml_tensor * c = g->nodes[k];
++            if (c->op == GGML_OP_CPY && c->src[0]->data == state && c->src[0]->type == GGML_TYPE_F32 &&
++                c->src[1]->type == GGML_TYPE_F32 && ggml_nbytes(c->src[0]) == bytes && ggml_nbytes(c->src[1]) == bytes &&
++                ggml_is_contiguous(c->src[0]) && ggml_is_contiguous(c->src[1])) {
++                j = k;
++                break;
++            }
++            if (ggml_cpu_node_touches(c, state, bytes)) {
++                break;
++            }
++        }
++        if (j < 0) {
++            continue;
++        }
++        void * cache = g->nodes[j]->src[1]->data;
++        bool ok = true;
++        for (int k = i + 1; ok && k < j; ++k) {
++            ok = !ggml_cpu_node_touches(g->nodes[k], cache, bytes) && !ggml_cpu_node_touches(g->nodes[k], state, bytes);
++        }
++        // nothing else reads the state range until it is written again
++        for (int k = j + 1; ok && k < n; ++k) {
++            const struct ggml_tensor * t = g->nodes[k];
++            if (ggml_cpu_node_reads(t, state, bytes)) {
++                ok = false;
++            } else if (!ggml_op_is_empty(t->op) && t->data && ggml_cpu_overlaps(t->data, ggml_nbytes(t), state, bytes)) {
++                break;
++            }
++        }
++        if (ok) {
++            tp->wb_dst[i]  = cache;
++            tp->wb_skip[j] = 1;
++        }
++    }
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3157,6 +3280,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        if (node_n < tp->wb_nodes && tp->wb_skip[node_n]) {
++            continue; // #190: the delta-net already wrote this copy's bytes
++        }
++        params.state_dst = node_n < tp->wb_nodes ? tp->wb_dst[node_n] : NULL;
++
+         ggml_compute_forward(&params, node);
+ 
+         if (state->ith == 0 && cplan->abort_callback &&
+@@ -3341,6 +3469,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+         threadpool->poll             = tpp->poll;
+         threadpool->prio             = tpp->prio;
+         threadpool->ec               = GGML_STATUS_SUCCESS;
++        threadpool->wb_dst           = NULL;
++        threadpool->wb_skip          = NULL;
++        threadpool->wb_cap           = 0;
++        threadpool->wb_nodes         = 0;
+     }
+ 
+     // Allocate and init workers state
+@@ -3454,6 +3586,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+         n_threads = threadpool->n_threads;
+     }
+ 
++    ggml_cpu_plan_state_writeback(threadpool, cgraph);
++
+     // Kick all threads to start the new graph
+     ggml_graph_compute_kickoff(threadpool, n_threads);
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 7a16378..7c01fe7 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2046,22 +2046,24 @@ static void ggml_compute_forward_concat_f32(
+ 
+     const float * x;
+ 
+-    // TODO: smarter multi-theading
+-    for (int i3 = 0; i3 < ne3; i3++) {
+-        for (int i2 = ith; i2 < ne2; i2 += nth) {
+-            for (int i1 = 0; i1 < ne1; i1++) {
+-                for (int i0 = 0; i0 < ne0; i0++) {
+-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
+-                    } else {
+-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+-                    }
++    // #190: rows (i1, i2, i3) split across the threads; decode's conv_input is
++    // one sequence of 8192 short rows, which the split over i2 left to one thread.
++    const int64_t nrows = ne1*ne2*ne3;
++    const int64_t ir0   = nrows*ith/nth, ir1 = nrows*(ith + 1)/nth; // contiguous: rows are 16 bytes here
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i3 = ir/(ne1*ne2);
++        const int64_t i2 = (ir/ne1)%ne2;
++        const int64_t i1 = ir%ne1;
++        for (int64_t i0 = 0; i0 < ne0; i0++) {
++            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
++            } else {
++                x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
++            }
+ 
+-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
++            float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+ 
+-                    *y = *x;
+-                }
+-            }
++            *y = *x;
+         }
+     }
+ }
+@@ -10486,7 +10488,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     // new_states:  S_v * S_v * H * n_seqs floats
+     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+     float * attn_out_base  = (float *)dst->data;
+-    float * state_out_base = (float *)dst->data + attn_score_elems;
++    float * state_out_base = params->state_dst ? (float *)params->state_dst : (float *)dst->data + attn_score_elems; // #190
+ 
+     const float * state_in_base = (const float *)src_state->data;
+ 
+@@ -10511,7 +10513,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+         // copy input state into output buffer and operate in-place
+         const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
+-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++        if (s_out != s_in) {
++            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++        }
+ 
+         // attn output pointer for first token of this (head, seq)
+         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;

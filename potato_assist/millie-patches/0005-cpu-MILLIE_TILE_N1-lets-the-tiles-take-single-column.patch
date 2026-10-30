@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:45:36 +0100
+Subject: [PATCH] cpu: MILLIE_TILE_N1 lets the tiles take single-column chunks
+ (#185)
+
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ff51ff6..3c41ba1 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1210,6 +1210,16 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+ typedef void (*ggml_gemm_tile_t)(int, int, int, const void *, size_t, const void * const *, float * const *);
+ 
++// MILLIE_TILE_N1=1 lets the tiles take single-column chunks too (decode).
++static bool ggml_cpu_gemm_tile_n1(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("MILLIE_TILE_N1");
++        on = e && atoi(e) != 0;
++    }
++    return on;
++}
++
+ static ggml_gemm_tile_t ggml_cpu_gemm_tile(enum ggml_type type, enum ggml_type vec_dot_type) {
+     if (vec_dot_type != GGML_TYPE_Q8_0) {
+         return NULL;
+@@ -1274,7 +1284,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+ #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+     // #185: Millie's two weight types take tiles once a chunk has two columns.
+     ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
+-    if (gemm && num_rows_per_vec_dot == 1 && ir1_end - ir1_start > 1 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
++    if (gemm && num_rows_per_vec_dot == 1 && (ir1_end - ir1_start > 1 || ggml_cpu_gemm_tile_n1()) && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+         const void * ys[16];
+         float * dsts[16];
+         for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+@@ -1569,7 +1579,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+     // #185: an expert with two or more columns in this chunk takes tiles.
+     ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
+-    if (gemm && ir1_end - ir1_start > 1) {
++    if (gemm && (ir1_end - ir1_start > 1 || ggml_cpu_gemm_tile_n1())) {
+         const void * ys[16];
+         float * dsts[16];
+         for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {

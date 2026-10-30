@@ -1,0 +1,528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:20:14 +0100
+Subject: [PATCH] cpu: Q4_SYM16F interleaved by four, on int8 activations
+ (#198)
+
+The vision encoder's type had only a scalar double-precision dot product
+on the CPU: 79 s per image at 256 tokens. Its reference now quantizes each
+16-value activation block to int8 and folds each block's exact integer sum
+in with one fma. The CPU repack buffer interleaves four rows per block; an
+sdot tile and, where the core has it, an i8mm tile reproduce the reference
+bit for bit. MILLIE_Q4FX4=0 keeps the weights plain, MILLIE_TILE_Q4F picks
+the tile shape.
+---
+ ggml/src/ggml-cpu/arch/arm/quants.c | 178 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cpu/quants.c          |  44 +++++--
+ ggml/src/ggml-cpu/quants.h          |   8 ++
+ ggml/src/ggml-cpu/repack.cpp        |  86 ++++++++++++++
+ tests/test-millie-qt2r.cpp          |  95 ++++++++++++++-
+ 5 files changed, 401 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 940cc45..a112e56 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -1399,6 +1399,184 @@ int ggml_q4_sym16k_x4_enabled(void) {
+     }
+     return v;
+ }
++
++// #198: Q4_SYM16F (the vision encoder's type) interleaved by four in the CPU
++// repack buffer. A block holds the same 16 columns of four rows: the four fp16
++// scales, then the nibbles as [half][row][4 bytes]. Columns are quantized once
++// per matmul, 16 values to a scale (ggml_q4_sym16f_quantize_act, in NEON with
++// the same roundings). Per (row, column) both tiles form the reference's
++// integer sum and fold it in with the reference's one fma per block, so the
++// output is bit-identical to ggml_vec_dot_q4_sym16f_f32.
++typedef struct {
++    ggml_half d[4];
++    uint8_t   qs[4*QK4_SYM16F/2];
++} block_q4_sym16f_x4;
++static_assert(sizeof(block_q4_sym16f_x4) == 4*sizeof(block_q4_sym16f), "wrong q4_sym16f_x4 block size");
++
++// One column per 16: the int8 values [even 0-7 | odd 0-7] for the sdot tile,
++// in order for smmla, 15 x their sum and half the scale.
++typedef struct {
++    float   dh;
++    int32_t ys15;
++    int8_t  yv[QK4_SYM16F];
++    int8_t  yn[QK4_SYM16F];
++} block_q4_sym16f_col;
++
++void ggml_repack_q4_sym16f_x4(const void * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n) {
++    const int64_t nb = n / QK4_SYM16F;
++    const block_q4_sym16f * x = (const block_q4_sym16f *) src;
++    block_q4_sym16f_x4 * out = (block_q4_sym16f_x4 *) dst;
++    for (int64_t g = 0; g < nrows / 4; ++g) {
++        for (int64_t i = 0; i < nb; ++i) {
++            block_q4_sym16f_x4 * o = out + g*nb + i;
++            for (int r = 0; r < 4; ++r) {
++                const block_q4_sym16f * b = x + (4*g + r)*nb + i;
++                o->d[r] = b->d;
++                memcpy(o->qs + 4*r,      b->qs,     4);
++                memcpy(o->qs + 16 + 4*r, b->qs + 4, 4);
++            }
++        }
++    }
++}
++
++size_t ggml_q4_sym16f_x4_col_size(int64_t n) {
++    return (size_t) (n / QK4_SYM16F) * sizeof(block_q4_sym16f_col);
++}
++
++void ggml_q4_sym16f_x4_col(const float * GGML_RESTRICT x, void * GGML_RESTRICT col, int64_t n) {
++    block_q4_sym16f_col * p = (block_q4_sym16f_col *) col;
++    const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
++    for (int64_t i = 0; i < n / QK4_SYM16F; ++i) {
++        const float * xb = x + i*QK4_SYM16F;
++        const float32x4_t v0 = vld1q_f32(xb), v1 = vld1q_f32(xb + 4), v2 = vld1q_f32(xb + 8), v3 = vld1q_f32(xb + 12);
++        const float amax = vmaxvq_f32(vmaxq_f32(vmaxq_f32(vabsq_f32(v0), vabsq_f32(v1)), vmaxq_f32(vabsq_f32(v2), vabsq_f32(v3))));
++        const float d  = amax / 127.0f;
++        const float id = d > 0.0f ? 1.0f / d : 0.0f;
++        const int32x4_t q0 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v0, id)), lo), hi);
++        const int32x4_t q1 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v1, id)), lo), hi);
++        const int32x4_t q2 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v2, id)), lo), hi);
++        const int32x4_t q3 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v3, id)), lo), hi);
++        const int8x16_t yn = vcombine_s8(vmovn_s16(vcombine_s16(vmovn_s32(q0), vmovn_s32(q1))),
++                                         vmovn_s16(vcombine_s16(vmovn_s32(q2), vmovn_s32(q3))));
++        vst1q_s8(p[i].yn, yn);
++        vst1q_s8(p[i].yv, vcombine_s8(vget_low_s8(vuzp1q_s8(yn, yn)), vget_low_s8(vuzp2q_s8(yn, yn))));
++        p[i].ys15 = 15 * vaddlvq_s8(yn);
++        p[i].dh   = 0.5f * d;
++    }
++}
++
++// NR columns of four interleaved rows, the rows in the lanes throughout.
++static inline __attribute__((always_inline)) void q4_sym16f_x4_tile(
++        const int NR, const int nb, const block_q4_sym16f_x4 * GGML_RESTRICT x,
++        const block_q4_sym16f_col * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    const uint8x16_t m4 = vdupq_n_u8(0x0F);
++    float32x4_t sum[MILLIE_TILE_NR_MAX];
++    for (int c = 0; c < NR; ++c) sum[c] = vdupq_n_f32(0.0f);
++    for (int i = 0; i < nb; ++i) {
++        const block_q4_sym16f_x4 * GGML_RESTRICT b = x + i;
++        const uint8x16_t v0 = vld1q_u8(b->qs), v1 = vld1q_u8(b->qs + 16);
++        const int8x16_t w0l = vreinterpretq_s8_u8(vandq_u8(v0, m4)), w0h = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
++        const int8x16_t w1l = vreinterpretq_s8_u8(vandq_u8(v1, m4)), w1h = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
++        const float32x4_t dw = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(b->d)));
++        for (int c = 0; c < NR; ++c) {
++            const block_q4_sym16f_col * GGML_RESTRICT p = ys[c] + i;
++            const int8x16_t yv = vld1q_s8(p->yv);
++            int32x4_t acc = vdotq_laneq_s32(vdupq_n_s32(0), w0l, yv, 0);
++            acc = vdotq_laneq_s32(acc, w0h, yv, 2);
++            acc = vdotq_laneq_s32(acc, w1l, yv, 1);
++            acc = vdotq_laneq_s32(acc, w1h, yv, 3);
++            const int32x4_t g = vsubq_s32(vshlq_n_s32(acc, 1), vdupq_n_s32(p->ys15));
++            sum[c] = vfmaq_f32(sum[c], vcvtq_f32_s32(g), vmulq_n_f32(dw, p->dh));
++        }
++    }
++    for (int c = 0; c < NR; ++c) vst1q_f32(dst[c] + r0, sum[c]);
++}
++
++#define MILLIE_Q4F_TILE_FN(NR) \
++    static void q4_sym16f_x4_tile_##NR(int nb, const block_q4_sym16f_x4 * x, const block_q4_sym16f_col * const * ys, float * const * dst, int r0) { \
++        q4_sym16f_x4_tile(NR, nb, x, ys, dst, r0); \
++    }
++MILLIE_Q4F_TILE_FN(1) MILLIE_Q4F_TILE_FN(2) MILLIE_Q4F_TILE_FN(4) MILLIE_Q4F_TILE_FN(8)
++
++// NR columns (even, at most 8) by smmla: two rows by two columns over 8 k, the
++// weights decoded to their signed levels 2c - 15, so the sum is the integer
++// the sdot tile forms; lanes [r c, r c+1, r+1 c, r+1 c+1] until the store.
++__attribute__((target("i8mm")))
++static void q4_sym16f_x4_tile_mm(const int NR, const int nb, const block_q4_sym16f_x4 * GGML_RESTRICT x,
++        const block_q4_sym16f_col * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    static const int8_t klut[16] = { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 };
++    const int8x16_t  lut = vld1q_s8(klut);
++    const uint8x16_t m4  = vdupq_n_u8(0x0F);
++    float32x4_t sum[2][MILLIE_TILE_NR_MAX/2];
++    for (int p = 0; p < 2; ++p) for (int cp = 0; cp < NR/2; ++cp) sum[p][cp] = vdupq_n_f32(0.0f);
++    for (int i = 0; i < nb; ++i) {
++        const block_q4_sym16f_x4 * GGML_RESTRICT b = x + i;
++        int8x16_t A[2][2];  // [half][row pair]
++        for (int h = 0; h < 2; ++h) {
++            const uint8x16_t v  = vld1q_u8(b->qs + 16*h);
++            const int8x16_t  wl = vqtbl1q_s8(lut, vandq_u8(v, m4));
++            const int8x16_t  wh = vqtbl1q_s8(lut, vshrq_n_u8(v, 4));
++            A[h][0] = vzip1q_s8(wl, wh);
++            A[h][1] = vzip2q_s8(wl, wh);
++        }
++        const float32x4_t dw = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(b->d)));
++        const float32x4_t dwp[2] = { vzip1q_f32(dw, dw), vzip2q_f32(dw, dw) };
++        for (int cp = 0; cp < NR/2; ++cp) {
++            const block_q4_sym16f_col * GGML_RESTRICT p0 = ys[2*cp]     + i;
++            const block_q4_sym16f_col * GGML_RESTRICT p1 = ys[2*cp + 1] + i;
++            const int8x16_t B0 = vcombine_s8(vld1_s8(p0->yn),     vld1_s8(p1->yn));
++            const int8x16_t B1 = vcombine_s8(vld1_s8(p0->yn + 8), vld1_s8(p1->yn + 8));
++            const float32x4_t dh = { p0->dh, p1->dh, p0->dh, p1->dh };
++            for (int p = 0; p < 2; ++p) {
++                const int32x4_t g = vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0), A[0][p], B0), A[1][p], B1);
++                sum[p][cp] = vfmaq_f32(sum[p][cp], vcvtq_f32_s32(g), vmulq_f32(dwp[p], dh));
++            }
++        }
++    }
++    for (int p = 0; p < 2; ++p) {
++        for (int cp = 0; cp < NR/2; ++cp) {
++            dst[2*cp    ][r0 + 2*p    ] = vgetq_lane_f32(sum[p][cp], 0);
++            dst[2*cp + 1][r0 + 2*p    ] = vgetq_lane_f32(sum[p][cp], 1);
++            dst[2*cp    ][r0 + 2*p + 1] = vgetq_lane_f32(sum[p][cp], 2);
++            dst[2*cp + 1][r0 + 2*p + 1] = vgetq_lane_f32(sum[p][cp], 3);
++        }
++    }
++}
++
++void ggml_gemm_q4_sym16f_x4(int64_t n, int64_t nrows, int nc, const void * GGML_RESTRICT vx, const void * const * vy, float * const * dst) {
++    typedef void (*tile_fn)(int, const block_q4_sym16f_x4 *, const block_q4_sym16f_col * const *, float * const *, int);
++    static const tile_fn tiles[8] = { q4_sym16f_x4_tile_1, q4_sym16f_x4_tile_2, NULL, q4_sym16f_x4_tile_4,
++                                      NULL, NULL, NULL, q4_sym16f_x4_tile_8 };
++    static atomic_int shape = -1;
++    const int v  = millie_shape_once(&shape, "MILLIE_TILE_Q4F", 4, 8);
++    const int nr = (v >> 4) > 0 ? (v & 15) : 1;
++    const int nb = (int) (n / QK4_SYM16F);
++    const block_q4_sym16f_col * const * ys = (const block_q4_sym16f_col * const *) vy;
++    const bool mm = millie_has_i8mm();
++    for (int c = 0; c < nc;) {
++        const int kc = millie_fit(nr, nc - c);
++        for (int64_t g = 0; g < nrows / 4; ++g) {
++            const block_q4_sym16f_x4 * xg = (const block_q4_sym16f_x4 *) vx + g*nb;
++            if (mm && kc >= 2) {
++                q4_sym16f_x4_tile_mm(kc, nb, xg, ys + c, dst + c, (int) (4*g));
++            } else {
++                tiles[kc - 1](nb, xg, ys + c, dst + c, (int) (4*g));
++            }
++        }
++        c += kc;
++    }
++}
++
++int ggml_q4_sym16f_x4_enabled(void) {
++    static atomic_int on = -1;
++    int v = atomic_load_explicit(&on, memory_order_relaxed);
++    if (v < 0) {
++        const char * e = getenv("MILLIE_Q4FX4");
++        v = e ? atoi(e) != 0 : 1;
++        atomic_store_explicit(&on, v, memory_order_relaxed);
++    }
++    return v;
++}
+ #endif
+ 
+ // SYM16 family: integer inner product via the doubling identity
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 5458d76..53d1678 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -9,6 +9,7 @@
+ #include "arch-fallback.h"
+ 
+ #include <string.h>
++#include <math.h>
+ #include <assert.h>
+ #include <float.h>
+ #include <stdlib.h> // for qsort
+@@ -1659,18 +1660,43 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+     quantize_iq4_xs(x, y, 1, k, NULL);
+ }
+ 
++// #198: Millie's vision encoder on the CPU. Each 16-value activation block is
++// quantized to int8 on its own scale, so a row of any multiple of 16 (the
++// encoder's 4,304) needs no tail. Per block the integer sum of (2c - 15) q is
++// exact, and it enters the float sum as one fma against d_w * d_a / 2, block by
++// block in order: the arithmetic the interleaved kernels in the CPU repack
++// buffer reproduce bit for bit.
++void ggml_q4_sym16f_quantize_act(const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT q, float * GGML_RESTRICT dh) {
++    float amax = 0.0f;
++    for (int k = 0; k < QK4_SYM16F; ++k) {
++        amax = fmaxf(amax, fabsf(x[k]));
++    }
++    const float d  = amax / 127.0f;
++    const float id = d > 0.0f ? 1.0f / d : 0.0f;
++    for (int k = 0; k < QK4_SYM16F; ++k) {
++        const float v = nearbyintf(x[k] * id);
++        q[k] = (int8_t) (v > 127.0f ? 127.0f : v < -127.0f ? -127.0f : v);
++    }
++    *dh = 0.5f * d;
++}
++
+ void ggml_vec_dot_q4_sym16f_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+-    assert(n % 16 == 0 && nrc == 1);
+-    (void)bs; (void)bx; (void)by;
++    assert(n % QK4_SYM16F == 0 && nrc == 1);
++    (void)bs; (void)bx; (void)by; (void)nrc;
+     const block_q4_sym16f * x = vx;
+     const float * y = vy;
+-    double sum = 0;
+-    for (int i = 0; i < n/16; ++i) {
+-        const float d = GGML_FP16_TO_FP32(x[i].d);
+-        for (int j = 0; j < 8; ++j) {
+-            sum += (double)(((x[i].qs[j]&15)-7.5f)*d)*y[i*16+2*j];
+-            sum += (double)(((x[i].qs[j]>>4)-7.5f)*d)*y[i*16+2*j+1];
++    float sum = 0.0f;
++    for (int i = 0; i < n/QK4_SYM16F; ++i) {
++        int8_t q[QK4_SYM16F];
++        float dh;
++        ggml_q4_sym16f_quantize_act(y + i*QK4_SYM16F, q, &dh);
++        int32_t g = 0;
++        for (int j = 0; j < QK4_SYM16F/2; ++j) {
++            g += (2*(x[i].qs[j] & 15) - 15) * q[2*j];
++            g += (2*(x[i].qs[j] >> 4) - 15) * q[2*j + 1];
+         }
++        const float scale = GGML_FP16_TO_FP32(x[i].d) * dh;
++        sum = fmaf((float) g, scale, sum);
+     }
+-    *s = (float)sum;
++    *s = sum;
+ }
+diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
+index dc5e311..af6ca25 100644
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -42,6 +42,7 @@ void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+ 
+ // Dot product
+ void ggml_vec_dot_q4_sym16f_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_q4_sym16f_quantize_act(const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT q, float * GGML_RESTRICT dh);
+ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q1_affine_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q1_sym16_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+@@ -80,6 +81,13 @@ void   ggml_q4_sym16k_x4_col(const float * GGML_RESTRICT x, void * GGML_RESTRICT
+ void   ggml_gemv_q4_sym16k_x4(int64_t n, int64_t nrows, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT col, float * GGML_RESTRICT dst);
+ void   ggml_gemm_q4_sym16k_x4(int64_t n, int64_t nrows, int nc, const void * GGML_RESTRICT vx, const void * const * vy, float * const * dst);
+ 
++// #198: Q4_SYM16F rows interleaved by four (CPU repack buffer); bit-identical to ggml_vec_dot_q4_sym16f_f32.
++int    ggml_q4_sym16f_x4_enabled(void);
++void   ggml_repack_q4_sym16f_x4(const void * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n);
++size_t ggml_q4_sym16f_x4_col_size(int64_t n);
++void   ggml_q4_sym16f_x4_col(const float * GGML_RESTRICT x, void * GGML_RESTRICT col, int64_t n);
++void   ggml_gemm_q4_sym16f_x4(int64_t n, int64_t nrows, int nc, const void * GGML_RESTRICT vx, const void * const * vy, float * const * dst);
++
+ // #185: QT_MS32K4 repacked as 2-bit codes; bit-identical to ggml_vec_dot_qt_ms32k4_q8_0.
+ void ggml_vec_dot_qt2_r_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_qt2_r_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 121f384..b1c0b33 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4851,6 +4851,88 @@ class q4_sym16k_x4_traits : public tensor_traits_base {
+         return 0;
+     }
+ };
++
++// #198: the vision encoder's Q4_SYM16F weights, rows interleaved by four. Its
++// matmuls are batched (the encoder runs every patch at once): each column is
++// quantized once, then tiles of four rows by up to eight columns. Bit-identical
++// to ggml_vec_dot_q4_sym16f_f32, so moving a weight here changes no output.
++class q4_sym16f_x4_traits : public tensor_traits_base {
++    static constexpr int64_t CHUNK_COLS = 64;
++
++    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
++        if (op->op != GGML_OP_MUL_MAT) {
++            return false;
++        }
++        size = ggml_q4_sym16f_x4_col_size(op->src[1]->ne[0]) * ggml_nrows(op->src[1]);
++        return true;
++    }
++
++    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
++        if (op->op != GGML_OP_MUL_MAT) {
++            return false;
++        }
++        const ggml_tensor * src0 = op->src[0];
++        const ggml_tensor * src1 = op->src[1];
++        ggml_tensor *       dst  = op;
++
++        GGML_TENSOR_BINARY_OP_LOCALS
++
++        GGML_ASSERT(src1->type == GGML_TYPE_F32 && nb10 == sizeof(float) && nb0 == sizeof(float));
++        GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne0 == ne01 && ne00 % QK4_SYM16F == 0);
++
++        const int     ith   = params->ith;
++        const int     nth   = params->nth;
++        const int64_t ncols = ne11 * ne12 * ne13;
++        const size_t  csize = ggml_q4_sym16f_x4_col_size(ne10);
++        char *        wdata = static_cast<char *>(params->wdata);
++
++        auto col_of = [](const ggml_tensor * t, int64_t c) {
++            const int64_t i1 = c % t->ne[1], i2 = (c / t->ne[1]) % t->ne[2], i3 = c / (t->ne[1] * t->ne[2]);
++            return (char *) t->data + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
++        };
++
++        if (ncols == 1) {
++            const int64_t nblk = ne10 / QK4_SYM16F;
++            const int64_t b0 = nblk * ith / nth, b1 = nblk * (ith + 1) / nth;
++            if (b1 > b0) {
++                ggml_q4_sym16f_x4_col((const float *) col_of(src1, 0) + b0 * QK4_SYM16F,
++                                      wdata + b0 * (csize / nblk), (b1 - b0) * QK4_SYM16F);
++            }
++        } else {
++            for (int64_t c = ith; c < ncols; c += nth) {
++                ggml_q4_sym16f_x4_col((const float *) col_of(src1, c), wdata + c * csize, ne10);
++            }
++        }
++        if (ith == 0) {
++            ggml_threadpool_chunk_set(params->threadpool, nth);
++        }
++        ggml_barrier(params->threadpool);
++
++        const int64_t rows    = std::min<int64_t>(256, std::max<int64_t>(16, ne01 / (4 * nth))) / 4 * 4;
++        const int64_t nchunk0 = (ne01 + rows - 1) / rows;
++        const int64_t nchunk1 = (ncols + CHUNK_COLS - 1) / CHUNK_COLS;
++        for (int64_t chunk = ith; chunk < nchunk0 * nchunk1; chunk = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++            const int64_t r0 = (chunk % nchunk0) * rows;
++            const int64_t nr = std::min(rows, ne01 - r0);
++            const int64_t c0 = (chunk / nchunk0) * CHUNK_COLS;
++            const int     nc = (int) std::min(CHUNK_COLS, ncols - c0);
++            const void *  ys[CHUNK_COLS];
++            float *       ds[CHUNK_COLS];
++            for (int c = 0; c < nc; ++c) {
++                ys[c] = wdata + (c0 + c) * csize;
++                ds[c] = (float *) col_of(dst, c0 + c) + r0;
++            }
++            ggml_gemm_q4_sym16f_x4(ne00, nr, nc, (const char *) src0->data + r0 * nb01, ys, ds);
++        }
++        return true;
++    }
++
++    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
++        GGML_ASSERT(t->type == GGML_TYPE_Q4_SYM16F && data_size == ggml_nbytes(t) && t->ne[1] % 4 == 0);
++        ggml_repack_q4_sym16f_x4(data, t->data, t->ne[1], t->ne[0]);
++        return 0;
++    }
++};
+ #endif
+ 
+ }  // namespace ggml::cpu::repack
+@@ -4861,6 +4943,10 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+     if (cur->type == GGML_TYPE_Q4_SYM16K && ggml_n_dims(cur) == 2 && cur->ne[1] % 4 == 0 && ggml_q4_sym16k_x4_enabled()) {
+         return &q4_sym16k_x4;
+     }
++    static const ggml::cpu::repack::q4_sym16f_x4_traits q4_sym16f_x4;
++    if (cur->type == GGML_TYPE_Q4_SYM16F && ggml_n_dims(cur) == 2 && cur->ne[1] % 4 == 0 && ggml_q4_sym16f_x4_enabled()) {
++        return &q4_sym16f_x4;
++    }
+ #endif
+ 
+     // instance for Q4
+diff --git a/tests/test-millie-qt2r.cpp b/tests/test-millie-qt2r.cpp
+index ba2a7ef..0b57e76 100644
+--- a/tests/test-millie-qt2r.cpp
++++ b/tests/test-millie-qt2r.cpp
+@@ -1,7 +1,7 @@
+ // #185: QT2_R (QT_MS32K4 repacked as 2-bit codes) must give the CPU backend
+ // the same bytes as the original: dequantization, mul_mat at every column
+ // count (GEMV and tiles) and mul_mat_id at Millie's expert shape. So must
+-// Q4_SYM16K interleaved by four in the CPU repack buffer.
++// Q4_SYM16K interleaved by four in the CPU repack buffer, and Q4_SYM16F (#198).
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+@@ -10,6 +10,7 @@
+ 
+ #include <cstdio>
+ #include <algorithm>
++#include <cmath>
+ #include <cstring>
+ #include <random>
+ #include <vector>
+@@ -233,6 +234,98 @@ int main() {
+         ggml_backend_free(cpu);
+     }
+ 
++    {   // #198: Q4_SYM16F (the vision encoder), plain against interleaved, at
++        // the encoder's widths: 1152, 4304 (= 16 x 269, no multiple of 32) and
++        // 4608. No quantizer exists for the type, so the blocks are random
++        // nibbles under finite scales. The old path's double sum is kept here
++        // as the yardstick for how far the int8 activations move a result.
++        ggml_backend_t cpu = ggml_backend_cpu_init();
++        ggml_backend_cpu_set_n_threads(cpu, 4);
++        ggml_backend_dev_t dev = ggml_backend_get_device(cpu);
++        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
++            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_get_extra_bufts");
++        ggml_backend_buffer_type_t repack = nullptr;
++        for (ggml_backend_buffer_type_t * b = get_extra ? get_extra(dev) : nullptr; b && *b; ++b) {
++            if (strcmp(ggml_backend_buft_name(*b), "CPU_REPACK") == 0) {
++                repack = *b;
++            }
++        }
++        const int64_t FM = 256;
++        std::uniform_int_distribution<int> byte(0, 255);
++        std::normal_distribution<float> scale(0.0f, 0.02f);
++        for (int64_t FK : { 1152, 4304, 4608 }) {
++            std::vector<block_q4_sym16f> q(FK / 16 * FM);
++            for (auto & b : q) {
++                b.d = ggml_fp32_to_fp16(scale(rng));
++                for (auto & v : b.qs) v = (uint8_t) byte(rng);
++            }
++            ggml_init_params wp = { ggml_tensor_overhead() * 4, nullptr, true };
++            ggml_context * cw = ggml_init(wp);
++            ggml_context * cr = ggml_init(wp);
++            ggml_tensor * wplain = ggml_new_tensor_2d(cw, GGML_TYPE_Q4_SYM16F, FK, FM);
++            ggml_tensor * wrep   = ggml_new_tensor_2d(cr, GGML_TYPE_Q4_SYM16F, FK, FM);
++            ggml_backend_buffer_t bplain = ggml_backend_alloc_ctx_tensors(cw, cpu);
++            ggml_backend_buffer_t brep   = repack ? ggml_backend_alloc_ctx_tensors_from_buft(cr, repack) : nullptr;
++            const bool interleaved = brep && wrep->extra != nullptr;
++            printf("q4_sym16f K=%-5lld in CPU_REPACK %20s\n", (long long) FK, interleaved ? "interleaved" : "NOT REPACKED");
++            ok &= interleaved;
++            if (interleaved) {
++                ggml_backend_tensor_set(wplain, q.data(), 0, q.size() * sizeof(block_q4_sym16f));
++                ggml_backend_tensor_set(wrep, q.data(), 0, q.size() * sizeof(block_q4_sym16f));
++                for (int64_t n : { 1, 2, 3, 5, 8, 17, 64, 100, 128, 129, 512 }) {
++                    ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
++                    ggml_context * cg = ggml_init(gp);
++                    ggml_tensor * b  = ggml_new_tensor_2d(cg, GGML_TYPE_F32, FK, n);
++                    ggml_tensor * c0 = ggml_mul_mat(cg, wplain, b);
++                    ggml_tensor * c1 = ggml_mul_mat(cg, wrep, b);
++                    ggml_cgraph * gf = ggml_new_graph(cg);
++                    ggml_build_forward_expand(gf, c0);
++                    ggml_build_forward_expand(gf, c1);
++                    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
++                    ggml_gallocr_alloc_graph(ga, gf);
++                    std::vector<float> bv(FK * n);
++                    fill_random(bv.data(), bv.size(), rng);
++                    ggml_backend_tensor_set(b, bv.data(), 0, bv.size() * sizeof(float));
++                    ggml_backend_graph_compute(cpu, gf);
++                    std::vector<float> r0(FM * n), r1(FM * n);
++                    ggml_backend_tensor_get(c0, r0.data(), 0, r0.size() * sizeof(float));
++                    ggml_backend_tensor_get(c1, r1.data(), 0, r1.size() * sizeof(float));
++                    const bool eq = memcmp(r0.data(), r1.data(), r0.size() * sizeof(float)) == 0;
++                    printf("q4_sym16f K=%-5lld repacked mul_mat n=%-5lld %s\n", (long long) FK, (long long) n, eq ? "identical" : "DIFFERS");
++                    ok &= eq;
++                    if (n == 64) {
++                        double dot = 0, n0 = 0, n1 = 0, err = 0;
++                        for (int64_t c = 0; c < n; ++c) {
++                            for (int64_t r = 0; r < FM; ++r) {
++                                double old = 0;
++                                const block_q4_sym16f * x = q.data() + r * (FK / 16);
++                                const float * y = bv.data() + c * FK;
++                                for (int64_t i = 0; i < FK / 16; ++i) {
++                                    const float d = ggml_fp16_to_fp32(x[i].d);
++                                    for (int j = 0; j < 8; ++j) {
++                                        old += (double) (((x[i].qs[j] & 15) - 7.5f) * d) * y[i*16 + 2*j];
++                                        old += (double) (((x[i].qs[j] >> 4) - 7.5f) * d) * y[i*16 + 2*j + 1];
++                                    }
++                                }
++                                const double v = r1[c * FM + r];
++                                dot += old * v; n0 += old * old; n1 += v * v; err += (old - v) * (old - v);
++                            }
++                        }
++                        printf("q4_sym16f K=%-5lld against the double path: cos %.7f, nmse %.2e\n",
++                               (long long) FK, dot / std::sqrt(n0 * n1), err / n0);
++                    }
++                    ggml_gallocr_free(ga);
++                    ggml_free(cg);
++                }
++            }
++            if (brep) ggml_backend_buffer_free(brep);
++            ggml_backend_buffer_free(bplain);
++            ggml_free(cr);
++            ggml_free(cw);
++        }
++        ggml_backend_free(cpu);
++    }
++
+     ggml_free(ctx);
+     printf("%s\n", ok ? "PASS" : "FAIL");
+     return ok ? 0 : 1;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 21:06:20 +0100
+Subject: [PATCH] cpu: thread affinity and priority on Android (#185)
+
+bionic defines __ANDROID__ but not __gnu_linux__, so the Linux branch that
+already carried an Android sched_setaffinity call was never compiled there:
+--cpu-mask, --cpu-strict and --prio were silently ignored. Unpinned, a
+compute thread that wakes from sleep can be packed onto a core that already
+runs one, and the spinning barrier then collapses a whole run (the 12R showed
+three of five threads on the X3 and reps of 1.2-4 tok/s beside 12). Pinned
+to the five big cores, tg128 at hot 64 holds 12.68 tok/s over six reps.
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 43af94f..3b48c34 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2708,8 +2708,10 @@ static bool ggml_thread_apply_priority(int32_t prio) {
+     return true;
+ }
+ 
+-#elif defined(__gnu_linux__)
++#elif defined(__gnu_linux__) || defined(__ANDROID__)
+ // TODO: this may not work on BSD, to be verified
++// #185: bionic does not define __gnu_linux__, so without __ANDROID__ here
++// --cpu-mask and --cpu-strict were silently ignored on Android.
+ 
+ static bool ggml_thread_apply_affinity(const bool * mask) {
+     cpu_set_t cpuset;

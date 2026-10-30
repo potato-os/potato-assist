@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 16:23:59 +0100
+Subject: [PATCH] metal: two-blocks-in-flight ffn_down mat-vec and a parallel
+ router policy update (#183)
+
+
+diff --git a/ggml/src/ggml-metal/ggml-hot-router-source.h b/ggml/src/ggml-metal/ggml-hot-router-source.h
+index 371e2c8..736142b 100644
+--- a/ggml/src/ggml-metal/ggml-hot-router-source.h
++++ b/ggml/src/ggml-metal/ggml-hot-router-source.h
+@@ -18,21 +18,36 @@ static const char * hot_router_source =
+ "    }\n"
+ "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ "  }\n"
++"  // #183: the policy update ran on one thread over thread-private arrays (~120 us);\n"
++"  // the same update in parallel over threadgroup memory, same results, same tie order.\n"
++"  threadgroup int selected[256]; threadgroup int keep[256]; threadgroup int next[256];\n"
++"  threadgroup int flag[256]; threadgroup int prefix[256]; threadgroup int free_slots[256]; threadgroup int nfree_tg;\n"
++"  selected[tid]=0; keep[tid]=0; threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(tid<8) { next[tid]=ids[tid]; selected[ids[tid]]=1; }\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  const int cap=s.capacity;\n"
++"  // survivors: queue entries not selected, in queue order, filling next[8..cap)\n"
++"  flag[tid]=(int(tid)<cap && !selected[s.queue[tid]]) ? 1 : 0;\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(tid==0) { int acc=0; for(int i=0;i<cap;i++){prefix[i]=acc; acc+=flag[i];} }\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(int(tid)<cap && flag[tid] && 8+prefix[tid]<cap) next[8+prefix[tid]]=s.queue[tid];\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(int(tid)<cap) keep[next[tid]]=1;\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  // evicted: queue entries not kept, in queue order, their slots freed\n"
++"  flag[tid]=(int(tid)<cap && !keep[s.queue[tid]]) ? 1 : 0;\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(tid==0) { int acc=0; for(int i=0;i<cap;i++){prefix[i]=acc; acc+=flag[i];} nfree_tg=acc; }\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(int(tid)<cap && flag[tid]) { int e=s.queue[tid]; free_slots[prefix[tid]]=s.slots[e]; s.slots[e]=-1; }\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
+ "  if(tid==0) {\n"
+-"    int next[256]; bool selected[256]; bool keep[256]; int free_slots[8];\n"
+-"    for(int e=0;e<256;e++) {selected[e]=false;keep[e]=false;}\n"
+-"    for(int i=0;i<8;i++) {next[i]=ids[i];selected[ids[i]]=true;}\n"
+-"    int count=8;\n"
+-"    for(int i=0;i<s.capacity && count<s.capacity;i++) if(!selected[s.queue[i]]) next[count++]=s.queue[i];\n"
+-"    for(int i=0;i<s.capacity;i++) keep[next[i]]=true;\n"
+-"    int nfree=0;\n"
+-"    for(int i=0;i<s.capacity;i++) if(!keep[s.queue[i]]) {free_slots[nfree++]=s.slots[s.queue[i]];s.slots[s.queue[i]]=-1;}\n"
+-"    s.miss_count=0;\n"
++"    int nfree=nfree_tg; s.miss_count=0;\n"
+ "    for(int i=0;i<8;i++) {int e=ids[i];if(s.slots[e]<0) {int slot=free_slots[--nfree];s.slots[e]=slot;s.request_expert[s.miss_count]=e;s.request_slot[s.miss_count++]=slot;}}\n"
+-"    for(int i=0;i<s.capacity;i++) s.queue[i]=next[i];\n"
+-"    for(int i=0;i<8;i++) {out[i]=ids[i];\n"
+-"      out[8+i]=s.slots[ids[i]];\n"
+-"    }\n"
+-"    s.tokens++;\n"
+ "  }\n"
++"  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
++"  if(int(tid)<cap) s.queue[tid]=next[tid];\n"
++"  if(tid<8) { out[tid]=ids[tid]; out[8+tid]=s.slots[ids[tid]]; }\n"
++"  if(tid==0) s.tokens++;\n"
+ "}\n";
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 9b333aa..9989c96 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -819,6 +819,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+             {
+                 nsg = N_SG_QT_MS32K4;
+                 nr0 = N_R0_QT_MS32K4;
++                if (ne00 <= 512) { // #183: at most two 256-weight blocks per row -> both simdgroup halves work
++                    nr0 *= 2;
++                    suffix = "_nb2";
++                }
+             } break;
+         case GGML_TYPE_Q4_SYM16F: { nsg = 2; nr0 = 1; } break;
+         case GGML_TYPE_Q4_SYM16K:
+@@ -1068,6 +1072,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = N_SG_QT_MS32K4;
+                 nr0 = N_R0_QT_MS32K4;
++                if (ne00 <= 512) { // #183: at most two 256-weight blocks per row -> both simdgroup halves work
++                    nr0 *= 2;
++                    suffix = "_nb2";
++                }
+             } break;
+         case GGML_TYPE_Q4_SYM16F: { nsg = 2; nr0 = 1; } break;
+         case GGML_TYPE_Q4_SYM16K:
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index edc6039..378a085 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9841,7 +9841,9 @@ kernel void kernel_mul_mv_q2_sym32k4_f32(
+ // words gives the running sign start (budget is per BLOCK, not sub-block),
+ // a 32-bit sign window is taken from fixed in-block 16-bit loads, and the
+ // signs are scattered onto the mask bits one nibble at a time.
+-template<short NR0, typename args_t>
++// #183: NBLK blocks in flight per simdgroup. The stock 4 idles lanes 16-31 on a
++// 512-wide row (two blocks); NBLK = 2 lets each 16-lane half take its own rows.
++template<short NR0, short NBLK, typename args_t>
+ void kernel_mul_mv_qt_ms32k4_f32_impl(
+         args_t args,
+         device const char * src0,
+@@ -9857,7 +9859,9 @@ void kernel_mul_mv_qt_ms32k4_f32_impl(
+     const int r1 = tgpig.y;
+     const int im = tgpig.z;
+ 
+-    const int first_row = (r0 * NSG + sgitg) * NR0;
++    constexpr short NHALF = 4/NBLK;                 // row groups per simdgroup (1 or 2)
++    const short hrow = tiisg/(8*NBLK);              // which row group this lane serves
++    const int first_row = (r0 * NSG + sgitg) * (NR0*NHALF) + hrow*NR0;
+ 
+     const uint i12 = im%args.ne12;
+     const uint i13 = im/args.ne12;
+@@ -9871,8 +9875,8 @@ void kernel_mul_mv_qt_ms32k4_f32_impl(
+     const int nb   = args.ne00/QKT_MS32K;
+     const int ns01 = args.nb01/args.nb00;
+ 
+-    const short ix = tiisg/8; // 0..3: block in flight
+-    const short it = tiisg%8; // sub-block within the block
++    const short ix = (tiisg/8) % NBLK; // block in flight within this row group
++    const short it = tiisg%8;          // sub-block within the block
+ 
+     float sumf[NR0]={0.f};
+ 
+@@ -9886,7 +9890,7 @@ void kernel_mul_mv_qt_ms32k4_f32_impl(
+     // two mask words instead of re-reading every preceding word.
+     const int nbmin = min(nb, ns01);
+ 
+-    for (int ib0 = 0; ib0 < nbmin; ib0 += 4) {
++    for (int ib0 = 0; ib0 < nbmin; ib0 += NBLK) {
+         const int  ib     = ib0 + ix;
+         const bool active = ib < nbmin;
+ 
+@@ -9904,7 +9908,7 @@ void kernel_mul_mv_qt_ms32k4_f32_impl(
+ 
+             const uint own   = popcount((uint)m0) + popcount((uint)m1);
+             const uint pre   = simd_prefix_exclusive_sum(own);
+-            const uint start = pre - simd_shuffle(pre, (ushort)(ix*8));
++            const uint start = pre - simd_shuffle(pre, (ushort)(tiisg & ~7)); // this block's first lane
+ 
+             if (active) {
+                 const uint8_t scb = xb->scales[it >> 1];
+@@ -9936,15 +9940,24 @@ void kernel_mul_mv_qt_ms32k4_f32_impl(
+             }
+         }
+ 
+-        yb += 4 * QKT_MS32K;
++        yb += NBLK * QKT_MS32K;
+     }
+ 
+     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+ 
+     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+-        float sum_all = simd_sum(sumf[row]);
+-        if (tiisg == 0) {
+-            dst_f32[first_row + row] = sum_all;
++        float v = sumf[row];
++        if (NHALF == 1) {
++            v = simd_sum(v);
++        } else {
++            // reduce within this lane's 16-lane half; xor 8 stays inside the half
++            v += simd_shuffle_xor(v, 8);
++            v += simd_shuffle_xor(v, 4);
++            v += simd_shuffle_xor(v, 2);
++            v += simd_shuffle_xor(v, 1);
++        }
++        if (tiisg % (8*NBLK) == 0) {
++            dst_f32[first_row + row] = v;
+         }
+     }
+ }
+@@ -9960,7 +9973,21 @@ kernel void kernel_mul_mv_qt_ms32k4_f32(
+         ushort tiisg[[thread_index_in_simdgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
+-    kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++    kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4, 4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++}
++
++[[host_name("kernel_mul_mv_qt_ms32k4_f32_nb2")]]
++kernel void kernel_mul_mv_qt_ms32k4_f32_nb2(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++
++    kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4, 2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
+ // Q4_SYM16K mat-vec: each thread owns one 32-elem chunk (2 sub-blocks) of a
+@@ -11570,7 +11597,8 @@ template [[host_name("kernel_mul_mv_id_q4_sym16_f32")]] kernel kernel_mul_mv_id_
+ template [[host_name("kernel_mul_mv_id_q2_sym16_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_sym16_f32_impl<N_R0_Q2_SYM16>>>;
+ template [[host_name("kernel_mul_mv_id_q1_sym32k_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q1_sym32k_f32_impl<N_R0_Q1_SYM32K>>>;
+ template [[host_name("kernel_mul_mv_id_q2_sym32k4_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_sym32k4_f32_impl<N_R0_Q2_SYM32K4>>>;
+-template [[host_name("kernel_mul_mv_id_qt_ms32k4_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4>>>;
++template [[host_name("kernel_mul_mv_id_qt_ms32k4_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4, 4>>>;
++template [[host_name("kernel_mul_mv_id_qt_ms32k4_f32_nb2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_qt_ms32k4_f32_impl<N_R0_QT_MS32K4, 2>>>;
+ template [[host_name("kernel_mul_mv_id_q4_sym16k_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_sym16k_f32_impl<N_R0_Q4_SYM16K>>>;
+ 
+ template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 22:29:30 +0100
+Subject: [PATCH] metal: the delta-net kernel writes the new state straight
+ into the recurrent cache (#185)
+
+GATED_DELTA_NET puts its final state after the attention output, and the
+graph then copies it into the recurrent cache: 30 x 2 MB copies per token,
+4.3 ms of the A19's 61 ms step (#183). The kernel now takes the state's
+destination as its own buffer. The graph is reordered for concurrency, so the
+op looks ahead in its encoder for that CPY; when nothing in between reads the
+state or touches the cache, the kernel writes the cache and the CPY is marked
+done. Same values in the same place: the Metal greedy text is unchanged.
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index a2ef23b..3efec84 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -97,6 +97,9 @@ struct ggml_metal_op {
+     bool use_concurrency;
+     bool use_capture;
+ 
++    // #185: later nodes an earlier op has already done (GATED_DELTA_NET's cache CPY)
++    std::vector<const ggml_tensor *> done;
++
+     int debug_graph;
+     int debug_fusion;
+ 
+@@ -207,6 +210,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         return 1;
+     }
+ 
++    if (std::find(ctx->done.begin(), ctx->done.end(), node) != ctx->done.end()) {
++        return 1;
++    }
++
+     int n_fuse = 1;
+ 
+     // check if the current node can run concurrently with other nodes before it
+@@ -1639,6 +1646,56 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+         /*.nb3  =*/ nb3,
+     };
+ 
++    // #185: the new state lands after the attention output, and the graph then
++    // copies it into the recurrent cache (4.3 ms of the A19's 61 ms token, #183).
++    // The graph is reordered for concurrency, so that CPY is found by looking
++    // ahead in this encoder's nodes; when nothing in between touches the state
++    // or the cache, the kernel writes the cache directly and the CPY is done.
++    const size_t         tail      = ggml_row_size(GGML_TYPE_F32, (int64_t) ne20*ne21*ne22*ne23);
++    ggml_metal_buffer_id bid_state = ggml_metal_get_buffer_id(op);
++    bid_state.offs += tail;
++    const ggml_tensor * fused_cpy = nullptr;
++    if (ctx->use_fusion && !(op->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
++        auto reads_state = [&](const ggml_tensor * t) { return t == op || (t->view_src == op && t->view_offs >= tail); };
++        for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
++            const ggml_tensor * n     = ctx->node(j);
++            const ggml_tensor * snap  = n->src[0];
++            const ggml_tensor * cache = n->src[1];
++            if (n->op == GGML_OP_CPY && snap && cache && snap->view_src == op && snap->view_offs == tail &&
++                ggml_is_contiguous(snap) && cache->type == GGML_TYPE_F32 && ggml_is_contiguous(cache) &&
++                ggml_nelements(cache) == ggml_nelements(snap) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                // nothing between may touch the cache it writes
++                bool clear = true;
++                for (int k = idx + 1; k < j && clear; ++k) {
++                    const ggml_tensor * m = ctx->node(k);
++                    clear = base(m) != base(cache);
++                    for (int i = 0; i < GGML_MAX_SRC && clear && m->src[i]; ++i) {
++                        clear = base(m->src[i]) != base(cache) && !reads_state(m->src[i]);
++                    }
++                }
++                fused_cpy = clear ? n : nullptr;
++                break;
++            }
++            for (int i = 0; i < GGML_MAX_SRC && n->src[i]; ++i) {
++                if (reads_state(n->src[i])) {
++                    j = ctx->n_nodes(); // another reader of the state: leave it where it is
++                    break;
++                }
++            }
++        }
++        if (fused_cpy) {
++            if (!ggml_metal_op_concurrency_check(ctx, fused_cpy)) {
++                ggml_metal_op_concurrency_reset(ctx);
++            }
++            bid_state = ggml_metal_get_buffer_id(fused_cpy->src[1]);
++            ctx->done.push_back(fused_cpy);
++            if (ctx->debug_graph > 0) {
++                GGML_LOG_DEBUG("%s: GATED_DELTA_NET writes the recurrent cache for %s\n", __func__, ggml_get_name(fused_cpy));
++            }
++        }
++    }
++
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // q
+@@ -1648,11 +1705,16 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
++    ggml_metal_encoder_set_buffer  (enc, bid_state,                            ida++); // new state
+ 
+     const int nsg = pipeline.nsg;
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+ 
++    if (fused_cpy && !ggml_metal_op_concurrency_add(ctx, fused_cpy)) {
++        ggml_metal_op_concurrency_reset(ctx);
++    }
++
+     return 1;
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 378a085..7913b12 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -2790,6 +2790,7 @@ kernel void kernel_gated_delta_net_impl(
+         device const char * b,
+         device const char * s,
+         device       char * dst,
++        device       char * state_out, // #185: dst's tail, or the recurrent cache the CPY would fill
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]])  {
+@@ -2876,7 +2877,7 @@ kernel void kernel_gated_delta_net_impl(
+         g_ptr += args.ne21*G;
+     }
+ 
+-    device float * dst_state = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
++    device float * dst_state = (device float *) (state_out) + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+ 
+     FOR_UNROLL (short j = 0; j < NSG; j++) {
+         const short is = tx*NSG + j;

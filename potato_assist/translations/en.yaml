@@ -1,0 +1,6 @@
+configuration:
+  default_model:
+    name: Default model
+    description: Model loaded on first start. After that, the model and its settings are chosen in the app's UI and remembered.
+network:
+  8080/tcp: Chat UI and APIs on your LAN, without authentication. Home Assistant doesn't need this port.

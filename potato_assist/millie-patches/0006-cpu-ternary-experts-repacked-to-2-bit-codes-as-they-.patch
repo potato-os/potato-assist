@@ -1,0 +1,1151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:53:50 +0100
+Subject: [PATCH] cpu: ternary experts repacked to 2-bit codes as they are
+ admitted (#185)
+
+QT_MS32K4's sign-rank decode costs the CPU about twice the 4-bit type per
+weight at one token. QT2_R holds the same ternary values as 2-bit codes with
+the same scales, so the CPU decodes an expert with a load, a shift and an AND
+per sixteen weights: 1113 -> 395 us for one layer's experts at one token on
+the 12R. The hot cache repacks each expert as it lands in its slot, which
+costs 0.25 ms per matrix, and the values, the integer dots and the float order
+are the GEMV's, so every result is bit-identical.
+
+The admission reads and repacks now run on the compute threads, which would
+otherwise spin at the barrier while the reader pool's threads compete for the
+big cores. LLAMA_HOT_REPACK=0 and LLAMA_HOT_COOP=0 keep the old paths.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 1863a73..3bf1314 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -443,7 +443,8 @@ extern "C" {
+         GGML_TYPE_Q2_SYM32K4 = 56, // 2.1875 bpw: 2-bit symmetric, sub-block=32, 4-bit UNSIGNED sub-scales + fp16 super-scale per 8 subs
+         GGML_TYPE_QT_MS32K4 = 57, // 1.6875 bpw: TERNARY (-1/0/+1), mask+sign coding, sub-block=32, 128 non-zeros per 256-weight block, 4-bit UNSIGNED sub-scales + fp16 super-scale per 8 subs
+         GGML_TYPE_Q4_SYM16F = 58, // 4-bit symmetric, group=16, fp16 scale
+-        GGML_TYPE_COUNT   = 59,
++        GGML_TYPE_QT2_R     = 59, // 2.1875 bpw: QT_MS32K4 repacked as 2-bit codes for the CPU; never in a file (#185)
++        GGML_TYPE_COUNT   = 60,
+     };
+ 
+     // precision
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index e1168ec..0b0e293 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -274,6 +274,18 @@ typedef struct {
+ } block_qt_ms32k4;
+ static_assert(sizeof(block_qt_ms32k4) == sizeof(ggml_half) + QKT_MS32K_SUPER/2 + QKT_MS32K/8 + QKT_MS32K_NZTOT/8, "wrong qt_ms32k4 block size/padding");
+ 
++// QT2_R (#185): QT_MS32K4's ternary values repacked for the CPU as 2-bit codes
++// (value + 1), with the same 4-bit sub-scales and fp16 super-scale. Byte p of
++// qs holds elements p, p+64, p+128 and p+192 at bits 0, 2, 4 and 6, so a
++// 16-byte load and one shift give 16 consecutive weights. Never in a file: the
++// hot-expert cache repacks experts into it as it admits them.
++typedef struct {
++    ggml_half d;                           // fp16 super-scale
++    uint8_t   scales[QKT_MS32K_SUPER / 2]; // 8 x 4-bit unsigned sub-scales
++    uint8_t   qs[QKT_MS32K / 4];           // 2-bit codes
++} block_qt2_r;
++static_assert(sizeof(block_qt2_r) == sizeof(ggml_half) + QKT_MS32K_SUPER/2 + QKT_MS32K/4, "wrong qt2_r block size/padding");
++
+ // Q4_SYM16K: 4-bit symmetric K-scale type. 8 sub-blocks of 16 (NOT 32);
+ // nibble order is PAIRWISE: byte j of a sub-block holds elements 2j (low
+ // nibble) and 2j+1 (high). value = (code - 7.5) * d * scales[s] (int8 sub-scales).
+diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
+index 90ecd84..ac5e861 100644
+--- a/ggml/src/ggml-cpu/arch-fallback.h
++++ b/ggml/src/ggml-cpu/arch-fallback.h
+@@ -22,6 +22,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+@@ -91,6 +92,7 @@
+ #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
+ #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ // quants.c
+ #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+ #define ggml_vec_dot_q4_sym16_q8_0_generic ggml_vec_dot_q4_sym16_q8_0
+@@ -136,6 +138,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+@@ -195,6 +198,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+@@ -246,6 +250,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+@@ -297,6 +302,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+@@ -371,6 +377,7 @@
+ #define ggml_vec_dot_q1_sym32k_q8_0_generic ggml_vec_dot_q1_sym32k_q8_0
+ #define ggml_vec_dot_q2_sym32k4_q8_0_generic ggml_vec_dot_q2_sym32k4_q8_0
+ #define ggml_vec_dot_qt_ms32k4_q8_0_generic ggml_vec_dot_qt_ms32k4_q8_0
++#define ggml_vec_dot_qt2_r_q8_0_generic ggml_vec_dot_qt2_r_q8_0
+ #define ggml_vec_dot_q4_sym16k_q8_0_generic ggml_vec_dot_q4_sym16k_q8_0
+ #define ggml_gemv_q4_sym16_4x4_q8_0_generic ggml_gemv_q4_sym16_4x4_q8_0
+ #define ggml_gemm_q4_sym16_4x4_q8_0_generic ggml_gemm_q4_sym16_4x4_q8_0
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 58e597c..800f070 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -469,6 +469,66 @@ void ggml_vec_dot_qt_ms32k4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
+ #endif
+ }
+ 
++#if defined(__ARM_NEON)
++// QT2_R's 2-bit codes to the ternary values of the 8 sub-blocks: byte p of qs
++// holds elements p, p+64, p+128, p+192 at bits 0, 2, 4, 6 (#185).
++static inline __attribute__((always_inline)) void qt2_r_decode(const block_qt2_r * GGML_RESTRICT x, int8x16_t q[QKT_MS32K_SUPER][2]) {
++    const uint8x16_t m3  = vdupq_n_u8(3);
++    const int8x16_t  one = vdupq_n_s8(1);
++    const uint8x16_t Q0 = vld1q_u8(x->qs), Q1 = vld1q_u8(x->qs + 16), Q2 = vld1q_u8(x->qs + 32), Q3 = vld1q_u8(x->qs + 48);
++#define QT2_VAL(v) vsubq_s8(vreinterpretq_s8_u8(v), one)
++    q[0][0] = QT2_VAL(vandq_u8(Q0, m3));                 q[0][1] = QT2_VAL(vandq_u8(Q1, m3));
++    q[1][0] = QT2_VAL(vandq_u8(Q2, m3));                 q[1][1] = QT2_VAL(vandq_u8(Q3, m3));
++    q[2][0] = QT2_VAL(vandq_u8(vshrq_n_u8(Q0, 2), m3));  q[2][1] = QT2_VAL(vandq_u8(vshrq_n_u8(Q1, 2), m3));
++    q[3][0] = QT2_VAL(vandq_u8(vshrq_n_u8(Q2, 2), m3));  q[3][1] = QT2_VAL(vandq_u8(vshrq_n_u8(Q3, 2), m3));
++    q[4][0] = QT2_VAL(vandq_u8(vshrq_n_u8(Q0, 4), m3));  q[4][1] = QT2_VAL(vandq_u8(vshrq_n_u8(Q1, 4), m3));
++    q[5][0] = QT2_VAL(vandq_u8(vshrq_n_u8(Q2, 4), m3));  q[5][1] = QT2_VAL(vandq_u8(vshrq_n_u8(Q3, 4), m3));
++    q[6][0] = QT2_VAL(vshrq_n_u8(Q0, 6));                q[6][1] = QT2_VAL(vshrq_n_u8(Q1, 6));
++    q[7][0] = QT2_VAL(vshrq_n_u8(Q2, 6));                q[7][1] = QT2_VAL(vshrq_n_u8(Q3, 6));
++#undef QT2_VAL
++}
++#endif
++
++// The ternary GEMV on repacked codes: the same integer values and the same
++// float order as ggml_vec_dot_qt_ms32k4_q8_0, so the same result to the bit.
++void ggml_vec_dot_qt2_r_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QKT_MS32K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++#if defined(__ARM_NEON)
++    const int nb = n / QKT_MS32K;
++    const block_qt2_r * GGML_RESTRICT x = vx;
++    const block_q8_0  * GGML_RESTRICT y = vy;
++
++    float sumf = 0.0f;
++    for (int i = 0; i < nb; i++) {
++        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
++        int8x16_t q[QKT_MS32K_SUPER][2];
++        qt2_r_decode(&x[i], q);
++        float32x4_t accv = vdupq_n_f32(0.0f);
++        for (int g4 = 0; g4 < 2; ++g4) {
++            int32x4_t p[4];
++            float sc4[4], d84[4];
++            for (int t = 0; t < 4; ++t) {
++                const int sb = 4*g4 + t;
++                const block_q8_0 * GGML_RESTRICT yb = &y[i*QKT_MS32K_SUPER + sb];
++                sc4[t] = (float)((sb & 1) ? (x[i].scales[sb >> 1] >> 4) : (x[i].scales[sb >> 1] & 0x0F));
++                d84[t] = GGML_CPU_FP16_TO_FP32(yb->d);
++                const int32x4_t pt = ggml_vdotq_s32(vdupq_n_s32(0), q[sb][0], vld1q_s8(yb->qs));
++                p[t] = ggml_vdotq_s32(pt, q[sb][1], vld1q_s8(yb->qs + 16));
++            }
++            const int32x4_t grp = vpaddq_s32(vpaddq_s32(p[0], p[1]), vpaddq_s32(p[2], p[3]));
++            accv = vfmaq_f32(accv, vcvtq_f32_s32(grp), vmulq_f32(vld1q_f32(sc4), vld1q_f32(d84)));
++        }
++        sumf += d * vaddvq_f32(accv);
++    }
++    *s = sumf;
++#else
++    ggml_vec_dot_qt2_r_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
++#endif
++}
++
+ void ggml_vec_dot_q4_sym16k_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+     assert(n % QK4_SYM16K == 0);
+     assert(nrc == 1);
+@@ -673,6 +733,52 @@ static inline __attribute__((always_inline)) void qt_ms32k4_q8_0_tile(
+     for (int c = 0; c < NR; ++c) for (int r = 0; r < MR; ++r) dst[c][r0 + r] = sums[r][c];
+ }
+ 
++static inline __attribute__((always_inline)) void qt2_r_q8_0_tile(
++        const int MR, const int NR, const int nb, const uint8_t * GGML_RESTRICT vx, const size_t bx,
++        const block_q8_0 * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    float sums[MILLIE_TILE_MR_MAX][MILLIE_TILE_NR_MAX];
++    for (int r = 0; r < MR; ++r) for (int c = 0; c < NR; ++c) sums[r][c] = 0.0f;
++
++    for (int i = 0; i < nb; ++i) {
++        int8x16_t q[MILLIE_TILE_MR_MAX][QKT_MS32K_SUPER][2];
++        float     sc[MILLIE_TILE_MR_MAX][QKT_MS32K_SUPER];
++        float     d[MILLIE_TILE_MR_MAX];
++        for (int r = 0; r < MR; ++r) {
++            const block_qt2_r * GGML_RESTRICT x = (const block_qt2_r *) (vx + (size_t) (r0 + r) * bx) + i;
++            d[r] = GGML_CPU_FP16_TO_FP32(x->d);
++            qt2_r_decode(x, q[r]);
++            for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++                sc[r][sb] = (float)((sb & 1) ? (x->scales[sb >> 1] >> 4) : (x->scales[sb >> 1] & 0x0F));
++            }
++        }
++        for (int c = 0; c < NR; ++c) {
++            const block_q8_0 * GGML_RESTRICT y = ys[c] + QKT_MS32K_SUPER*i;
++            int8x16_t yv[QKT_MS32K_SUPER][2];
++            float d8[QKT_MS32K_SUPER];
++            for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++                yv[sb][0] = vld1q_s8(y[sb].qs);
++                yv[sb][1] = vld1q_s8(y[sb].qs + 16);
++                d8[sb]    = GGML_CPU_FP16_TO_FP32(y[sb].d);
++            }
++            for (int r = 0; r < MR; ++r) {
++                float32x4_t accv = vdupq_n_f32(0.0f);
++                for (int g4 = 0; g4 < 2; ++g4) {
++                    int32x4_t p[4];
++                    for (int t = 0; t < 4; ++t) {
++                        const int sb = 4*g4 + t;
++                        const int32x4_t pt = ggml_vdotq_s32(vdupq_n_s32(0), q[r][sb][0], yv[sb][0]);
++                        p[t] = ggml_vdotq_s32(pt, q[r][sb][1], yv[sb][1]);
++                    }
++                    const int32x4_t grp = vpaddq_s32(vpaddq_s32(p[0], p[1]), vpaddq_s32(p[2], p[3]));
++                    accv = vfmaq_f32(accv, vcvtq_f32_s32(grp), vmulq_f32(vld1q_f32(&sc[r][4*g4]), vld1q_f32(&d8[4*g4])));
++                }
++                sums[r][c] += d[r] * vaddvq_f32(accv);
++            }
++        }
++    }
++    for (int c = 0; c < NR; ++c) for (int r = 0; r < MR; ++r) dst[c][r0 + r] = sums[r][c];
++}
++
+ #define MILLIE_TILE_FN(type, MR, NR) \
+     static void type##_q8_0_tile_##MR##x##NR(int nb, const uint8_t * vx, size_t bx, \
+             const block_q8_0 * const * ys, float * const * dst, int r0) { \
+@@ -685,6 +791,7 @@ static inline __attribute__((always_inline)) void qt_ms32k4_q8_0_tile(
+     MILLIE_TILE_FN(type, 1, 8) MILLIE_TILE_FN(type, 2, 8) MILLIE_TILE_FN(type, 4, 8) MILLIE_TILE_FN(type, 8, 8)
+ MILLIE_TILE_SHAPES(q4_sym16k)
+ MILLIE_TILE_SHAPES(qt_ms32k4)
++MILLIE_TILE_SHAPES(qt2_r)
+ 
+ typedef void (*millie_tile_fn)(int, const uint8_t *, size_t, const block_q8_0 * const *, float * const *, int);
+ #define MILLIE_TILE_ROW(type, MR) { type##_q8_0_tile_##MR##x1, type##_q8_0_tile_##MR##x2, NULL, type##_q8_0_tile_##MR##x4, NULL, NULL, NULL, type##_q8_0_tile_##MR##x8 }
+@@ -696,6 +803,10 @@ static const millie_tile_fn millie_tiles_qt[8][8] = {
+     [0] = MILLIE_TILE_ROW(qt_ms32k4, 1), [1] = MILLIE_TILE_ROW(qt_ms32k4, 2),
+     [3] = MILLIE_TILE_ROW(qt_ms32k4, 4), [7] = MILLIE_TILE_ROW(qt_ms32k4, 8),
+ };
++static const millie_tile_fn millie_tiles_qt2[8][8] = {
++    [0] = MILLIE_TILE_ROW(qt2_r, 1), [1] = MILLIE_TILE_ROW(qt2_r, 2),
++    [3] = MILLIE_TILE_ROW(qt2_r, 4), [7] = MILLIE_TILE_ROW(qt2_r, 8),
++};
+ 
+ // MILLIE_TILE_Q4 / MILLIE_TILE_QT = "<MR>x<NR>" pick a shape per type (MR, NR
+ // in 1, 2, 4, 8); "0" turns the type's tiles off. Read once.
+@@ -744,8 +855,17 @@ int ggml_gemm_qt_ms32k4_q8_0_enabled(void) {
+ }
+ 
+ void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
+-    static int mr = -1, nrr;
+-    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nrr);
++    static int mr = -1, nrr, mr1, nr1;
++    if (mr < 0) {
++        millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nrr);
++        // One column is a decoded token: the rows still share the activation
++        // block, but a narrower tile keeps more of it in registers.
++        millie_tile_shape("MILLIE_TILE_Q4_N1", 2, 1, &mr1, &nr1);
++    }
++    if (nc == 1 && mr1 > 0) {
++        millie_gemm(millie_tiles_q4, mr1, 1, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
++        return;
++    }
+     millie_gemm(millie_tiles_q4, mr, nrr, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
+ }
+ 
+@@ -754,6 +874,12 @@ void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx,
+     if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nrr);
+     millie_gemm(millie_tiles_qt, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
+ }
++
++void ggml_gemm_qt2_r_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
++    static int mr = -1, nrr;
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nrr);
++    millie_gemm(millie_tiles_qt2, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
++}
+ #endif
+ 
+ // SYM16 family: integer inner product via the doubling identity
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 3c41ba1..43af94f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -265,6 +265,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .vec_dot_type             = GGML_TYPE_Q8_0,
+         .nrows                    = 1,
+     },
++    [GGML_TYPE_QT2_R] = {
++        .vec_dot                  = ggml_vec_dot_qt2_r_q8_0,
++        .vec_dot_type             = GGML_TYPE_Q8_0,
++        .nrows                    = 1,
++    },
+     [GGML_TYPE_Q1_SYM32K] = {
+         .from_float               = quantize_row_q1_sym32k,
+         .vec_dot                  = ggml_vec_dot_q1_sym32k_q8_0,
+@@ -1215,21 +1220,29 @@ static bool ggml_cpu_gemm_tile_n1(void) {
+     static int on = -1;
+     if (on < 0) {
+         const char * e = getenv("MILLIE_TILE_N1");
+-        on = e && atoi(e) != 0;
++        on = e ? atoi(e) != 0 : 1; // on by default: MILLIE_TILE_Q4_N1 picks the shape
+     }
+     return on;
+ }
+ 
+-static ggml_gemm_tile_t ggml_cpu_gemm_tile(enum ggml_type type, enum ggml_type vec_dot_type) {
++static ggml_gemm_tile_t ggml_cpu_gemm_tile(enum ggml_type type, enum ggml_type vec_dot_type, bool single_column) {
+     if (vec_dot_type != GGML_TYPE_Q8_0) {
+         return NULL;
+     }
++    // At one column only the 4-bit type beats its GEMV: the ternary tiles pay
++    // for a decode they cannot amortise (#185).
++    if (single_column && type != GGML_TYPE_Q4_SYM16K) {
++        return NULL;
++    }
+     if (type == GGML_TYPE_Q4_SYM16K && ggml_gemm_q4_sym16k_q8_0_enabled()) {
+         return ggml_gemm_q4_sym16k_q8_0;
+     }
+     if (type == GGML_TYPE_QT_MS32K4 && ggml_gemm_qt_ms32k4_q8_0_enabled()) {
+         return ggml_gemm_qt_ms32k4_q8_0;
+     }
++    if (type == GGML_TYPE_QT2_R && ggml_gemm_qt_ms32k4_q8_0_enabled()) {
++        return ggml_gemm_qt2_r_q8_0;
++    }
+     return NULL;
+ }
+ #endif
+@@ -1283,7 +1296,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+ 
+ #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+     // #185: Millie's two weight types take tiles once a chunk has two columns.
+-    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
++    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type, ir1_end - ir1_start == 1);
+     if (gemm && num_rows_per_vec_dot == 1 && (ir1_end - ir1_start > 1 || ggml_cpu_gemm_tile_n1()) && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+         const void * ys[16];
+         float * dsts[16];
+@@ -1578,7 +1591,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+ #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+     // #185: an expert with two or more columns in this chunk takes tiles.
+-    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
++    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type, ir1_end - ir1_start == 1);
+     if (gemm && (ir1_end - ir1_start > 1 || ggml_cpu_gemm_tile_n1())) {
+         const void * ys[16];
+         float * dsts[16];
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 46100bc..7a16378 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -4842,6 +4842,7 @@ void ggml_compute_forward_get_rows(
+         case GGML_TYPE_Q4_SYM16F:
+         case GGML_TYPE_Q4_SYM16K:
+         case GGML_TYPE_QT_MS32K4:
++        case GGML_TYPE_QT2_R:
+         case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q4_1:
+         case GGML_TYPE_Q5_0:
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index a128b3f..78959ea 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -377,6 +377,32 @@ void ggml_vec_dot_qt_ms32k4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t
+     *s = sumf;
+ }
+ 
++void ggml_vec_dot_qt2_r_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QKT_MS32K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++    const int nb = n / QKT_MS32K;
++    const block_qt2_r * GGML_RESTRICT x = vx;
++    const block_q8_0  * GGML_RESTRICT y = vy;
++    float sumf = 0.0f;
++    for (int i = 0; i < nb; i++) {
++        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
++        float acc = 0.0f;
++        for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++            const block_q8_0 * GGML_RESTRICT yb = &y[i*QKT_MS32K_SUPER + sb];
++            const uint8_t sc = (sb & 1) ? (x[i].scales[sb >> 1] >> 4) : (x[i].scales[sb >> 1] & 0x0F);
++            int sumi = 0;
++            for (int j = 0; j < QKT_MS32K_SUB; ++j) {
++                const int e = sb*QKT_MS32K_SUB + j;
++                sumi += (((x[i].qs[e & 63] >> (2 * (e >> 6))) & 3) - 1) * (int) yb->qs[j];
++            }
++            acc += (float) sc * GGML_CPU_FP16_TO_FP32(yb->d) * (float) sumi;
++        }
++        sumf += d * acc;
++    }
++    *s = sumf;
++}
++
+ void ggml_vec_dot_q1_sym32k_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+     assert(n % QK1_SYM32K == 0);
+     assert(nrc == 1);
+diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
+index ea01db0..3042c9e 100644
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -67,6 +67,11 @@ int  ggml_gemm_q4_sym16k_q8_0_enabled(void);
+ int  ggml_gemm_qt_ms32k4_q8_0_enabled(void);
+ void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst);
+ void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst);
++void ggml_gemm_qt2_r_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst);
++
++// #185: QT_MS32K4 repacked as 2-bit codes; bit-identical to ggml_vec_dot_qt_ms32k4_q8_0.
++void ggml_vec_dot_qt2_r_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_qt2_r_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q1_sym32k_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_sym16k_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void quantize_row_q1_sym32k(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 1f715d9..2727d30 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -1166,6 +1166,107 @@ void dequantize_row_qt_ms32k4(const block_qt_ms32k4 * GGML_RESTRICT x, float * G
+     }
+ }
+ 
++#if defined(__ARM_NEON)
++// Each lane holds the bit selecting its packed sign, or zero for a zero
++// weight (the CPU vec_dot's table, rebuilt here for the repack).
++static uint64_t qt2_sign_bit[256];
++__attribute__((constructor)) static void qt2_sign_bit_init(void) {
++    for (int B = 0; B < 256; ++B) {
++        uint64_t pat = 0;
++        int rank = 0;
++        for (int j = 0; j < 8; ++j) {
++            const uint64_t v = (B >> j) & 1 ? (1ull << rank) : 0;
++            pat |= v << (8*j);
++            rank += (B >> j) & 1;
++        }
++        qt2_sign_bit[B] = pat;
++    }
++}
++#endif
++
++void ggml_repack_qt_ms32k4_qt2_r(const block_qt_ms32k4 * GGML_RESTRICT x, block_qt2_r * GGML_RESTRICT y, int64_t nblocks) {
++    for (int64_t i = 0; i < nblocks; i++) {
++        y[i].d = x[i].d;
++        memcpy(y[i].scales, x[i].scales, sizeof(y[i].scales));
++#if defined(__ARM_NEON)
++        // The vec_dot's decode (sign window at the running popcount), then
++        // value + 1 shifted into place.
++        uint64_t s_lo, s_hi;
++        memcpy(&s_lo, x[i].signs,     8);
++        memcpy(&s_hi, x[i].signs + 8, 8);
++        unsigned start = 0;
++        uint8x16_t acc[4] = { vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0) };
++        const int8x16_t one = vdupq_n_s8(1);
++        for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++            uint32_t m;
++            memcpy(&m, x[i].mask + 4*sb, 4);
++            int8x16_t q0 = vdupq_n_s8(0), q1 = vdupq_n_s8(0);
++            if (m != 0) {
++                const uint32_t win = (uint32_t)(start < 64
++                    ? ((s_lo >> start) | (start ? (s_hi << (64 - start)) : 0))
++                    : (s_hi >> (start - 64)));
++                const uint32_t mA = m & 0xff, mB = (m >> 8) & 0xff, mC = (m >> 16) & 0xff, mD = m >> 24;
++                const uint32_t counts = vget_lane_u32(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(m))), 0) * 0x01010101u;
++                const uint8_t w0 = (uint8_t)win;
++                const uint8_t w1 = (uint8_t)(win >> (counts & 255));
++                const uint8_t w2 = (uint8_t)(win >> ((counts >> 8) & 255));
++                const uint8_t w3 = (uint8_t)(win >> ((counts >> 16) & 255));
++                const uint8x16_t winv0 = vcombine_u8(vdup_n_u8(w0), vdup_n_u8(w1));
++                const uint8x16_t winv1 = vcombine_u8(vdup_n_u8(w2), vdup_n_u8(w3));
++                const uint8x16_t P0 = vcombine_u8(vcreate_u8(qt2_sign_bit[mA]), vcreate_u8(qt2_sign_bit[mB]));
++                const uint8x16_t P1 = vcombine_u8(vcreate_u8(qt2_sign_bit[mC]), vcreate_u8(qt2_sign_bit[mD]));
++                const uint8x16_t mFF0 = vtstq_u8(P0, P0);
++                const uint8x16_t mFF1 = vtstq_u8(P1, P1);
++                const uint8x16_t sFF0 = vtstq_u8(winv0, P0);
++                const uint8x16_t sFF1 = vtstq_u8(winv1, P1);
++                q0 = vreinterpretq_s8_u8(vsubq_u8(vaddq_u8(sFF0, sFF0), mFF0));
++                q1 = vreinterpretq_s8_u8(vsubq_u8(vaddq_u8(sFF1, sFF1), mFF1));
++                start += counts >> 24;
++            }
++            const int8x16_t shift = vdupq_n_s8((int8_t)(2 * (sb >> 1)));
++            const int k0 = 2 * (sb & 1);
++            acc[k0]     = vorrq_u8(acc[k0],     vshlq_u8(vreinterpretq_u8_s8(vaddq_s8(q0, one)), shift));
++            acc[k0 + 1] = vorrq_u8(acc[k0 + 1], vshlq_u8(vreinterpretq_u8_s8(vaddq_s8(q1, one)), shift));
++        }
++        for (int k = 0; k < 4; ++k) vst1q_u8(y[i].qs + 16*k, acc[k]);
++#else
++        memset(y[i].qs, 0, sizeof(y[i].qs));
++        int idx = 0;
++        for (int e = 0; e < QKT_MS32K; ++e) {
++            int code = 1;
++            if ((x[i].mask[e >> 3] >> (e & 7)) & 1) {
++                code = ((x[i].signs[idx >> 3] >> (idx & 7)) & 1) ? 0 : 2;
++                idx++;
++            }
++            y[i].qs[e & 63] |= (uint8_t)(code << (2 * (e >> 6)));
++        }
++#endif
++    }
++}
++
++void dequantize_row_qt2_r(const block_qt2_r * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QKT_MS32K == 0);
++    const int nb = k / QKT_MS32K;
++    for (int i = 0; i < nb; i++) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        for (int e = 0; e < QKT_MS32K; ++e) {
++            const int s = e / QKT_MS32K_SUB;
++            const uint8_t sc = (s & 1) ? (x[i].scales[s >> 1] >> 4) : (x[i].scales[s >> 1] & 0x0F);
++            const int code = (x[i].qs[e & 63] >> (2 * (e >> 6))) & 3;
++            y[i*QKT_MS32K + e] = code == 1 ? 0.0f : (code == 2 ? d * (float) sc : -(d * (float) sc));
++        }
++    }
++}
++
++void quantize_row_qt2_r_ref(const float * GGML_RESTRICT x, block_qt2_r * GGML_RESTRICT y, int64_t k) {
++    assert(k % QKT_MS32K == 0);
++    for (int64_t i = 0; i < k / QKT_MS32K; i++) {
++        block_qt_ms32k4 t;
++        quantize_row_qt_ms32k4_ref(x + i*QKT_MS32K, &t, QKT_MS32K);
++        ggml_repack_qt_ms32k4_qt2_r(&t, &y[i], 1);
++    }
++}
++
+ void quantize_row_qt_ms32k4_ref(const float * GGML_RESTRICT x, block_qt_ms32k4 * GGML_RESTRICT y, int64_t k) {
+     assert(k % QKT_MS32K == 0);
+     const int nb = k / QKT_MS32K;
+@@ -1215,6 +1316,19 @@ void quantize_row_qt_ms32k4_ref(const float * GGML_RESTRICT x, block_qt_ms32k4 *
+     }
+ }
+ 
++size_t quantize_qt2_r(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    GGML_UNUSED(imatrix);
++    assert(n_per_row % QKT_MS32K == 0);
++    const size_t row_size = ggml_row_size(GGML_TYPE_QT2_R, n_per_row);
++    char * qrow = (char *) dst;
++    for (int64_t row = 0; row < nrows; ++row) {
++        quantize_row_qt2_r_ref(src, (block_qt2_r *) qrow, n_per_row);
++        src += n_per_row;
++        qrow += row_size;
++    }
++    return nrows * row_size;
++}
++
+ size_t quantize_qt_ms32k4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+     GGML_UNUSED(imatrix);
+     assert(n_per_row % QKT_MS32K == 0);
+@@ -6055,6 +6169,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+         case GGML_TYPE_Q2_SYM32K4: {
+             VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_sym32k4, data, nb);
+         } break;
++        case GGML_TYPE_QT2_R: {
++            VALIDATE_ROW_DATA_D_F16_IMPL(block_qt2_r, data, nb);
++        } break;
+         case GGML_TYPE_QT_MS32K4: {
+             VALIDATE_ROW_DATA_D_F16_IMPL(block_qt_ms32k4, data, nb);
+             for (size_t i = 0; i < nb; ++i) {
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 1684345..299b9f3 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -120,6 +120,12 @@ GGML_API size_t quantize_q2_sym32k4(const float * GGML_RESTRICT src, void * GGML
+ 
+ GGML_API void dequantize_row_qt_ms32k4(const block_qt_ms32k4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_qt_ms32k4_ref(const float * GGML_RESTRICT x, block_qt_ms32k4 * GGML_RESTRICT y, int64_t k);
++
++// #185: QT_MS32K4 -> QT2_R, the same ternary values as 2-bit codes.
++GGML_API void ggml_repack_qt_ms32k4_qt2_r(const block_qt_ms32k4 * GGML_RESTRICT x, block_qt2_r * GGML_RESTRICT y, int64_t nblocks);
++GGML_API void dequantize_row_qt2_r(const block_qt2_r * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void quantize_row_qt2_r_ref(const float * GGML_RESTRICT x, block_qt2_r * GGML_RESTRICT y, int64_t k);
++GGML_API size_t quantize_qt2_r(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_qt_ms32k4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_q4_sym16k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index ff0de09..7137fbb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -733,6 +733,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .to_float                 = (ggml_to_float_t) dequantize_row_qt_ms32k4,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_qt_ms32k4_ref,
+     },
++    [GGML_TYPE_QT2_R] = {
++        .type_name                = "qt2_r",
++        .blck_size                = QKT_MS32K,
++        .type_size                = sizeof(block_qt2_r),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_qt2_r,
++        .from_float_ref           = (ggml_from_float_t) quantize_row_qt2_r_ref,
++    },
+     [GGML_TYPE_Q4_SYM16F] = {
+         .type_name = "q4_sym16f",
+         .blck_size = QK4_SYM16F,
+@@ -7759,6 +7767,7 @@ size_t ggml_quantize_chunk(
+         case GGML_TYPE_Q2_SYM16: result = quantize_block_q2_sym16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q4_SYM16: result = quantize_q4_sym16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q2_SYM32K4: result = quantize_q2_sym32k4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
++        case GGML_TYPE_QT2_R:     result = quantize_qt2_r(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_QT_MS32K4: result = quantize_qt_ms32k4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q1_SYM32K: result = quantize_q1_sym32k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q4_SYM16K: result = quantize_q4_sym16k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a70386d..f2f8e45 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -63,6 +63,9 @@ endif()
+ option(LLAMA_HOT_CPU "llama: hot-expert cache on the CPU backend (#183 port)" OFF)
+ if (GGML_METAL OR LLAMA_HOT_CPU)
+     target_compile_definitions(llama PRIVATE LLAMA_HOT_CACHE)
++    # The cache can repack ternary experts as it admits them (#185, CPU only),
++    # so it needs ggml's own block layouts and the repack itself.
++    target_include_directories(llama PRIVATE ../ggml/src)
+ endif()
+ if (GGML_METAL)
+     target_compile_definitions(llama PRIVATE LLAMA_HOT_METAL)
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 602c052..8c2ec44 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -9,6 +9,7 @@
+ #    include "ggml-alloc.h"
+ #    include "ggml-backend.h"
+ #    include "ggml-hot-router.h"
++#    include "ggml-quants.h"
+ #    include "llama-hot-policy.h"
+ #    include "llama-hot-profile.h"
+ 
+@@ -25,6 +26,7 @@
+ 
+ #    include <algorithm>
+ #    include <atomic>
++#    include <thread>
+ #    include <cerrno>
+ #    include <cmath>
+ #    include <cstdio>
+@@ -188,6 +190,30 @@ static void hot_pread_exact(int fd, unsigned char * dst, size_t bytes, size_t of
+ #    endif
+ 
+ 
++// #185: on a CPU-only build the slots hold QT2_R — the same ternary values as
++// 2-bit codes, which the CPU decodes about three times faster at one token.
++// Metal builds keep the file's layout, which its kernels read directly.
++// #185: with the cache on the CPU the admission reads and repacks run on the
++// compute threads, which are otherwise spinning at the barrier on the big
++// cores while the reader pool's threads compete for whatever is left.
++static bool hot_cooperative_reads() {
++#    if defined(LLAMA_HOT_METAL)
++    return false;
++#    else
++    static const bool on = !getenv("LLAMA_HOT_COOP") || atoi(getenv("LLAMA_HOT_COOP")) != 0;
++    return on;
++#    endif
++}
++
++static bool hot_repack_experts() {
++#    if defined(LLAMA_HOT_METAL)
++    return false;
++#    else
++    static const bool repack = !getenv("LLAMA_HOT_REPACK") || atoi(getenv("LLAMA_HOT_REPACK")) != 0;
++    return repack;
++#    endif
++}
++
+ static bool metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+     const auto type   = ggml_backend_buffer_get_type(buffer);
+     const auto device = ggml_backend_buft_get_device(type);
+@@ -224,11 +250,21 @@ struct llama_hot_cache {
+     struct weight {
+         ggml_tensor * tensor;
+         int           fd;
+-        size_t        offset, stride;
++        size_t        offset, stride;      // in the file
++        size_t        slot_stride = 0;     // in the slot tensor (differs when repacked)
++        bool          repack      = false; // QT_MS32K4 in the file, QT2_R in the slot (#185)
+ 
+         ~weight() { close(fd); }
+     };
+ 
++    struct read_job {
++        weight *        w;
++        unsigned char * data;
++        size_t          offset;
++        size_t          bytes      = 0;
++        unsigned char * repack_dst = nullptr; // #185: read into scratch, repack into here
++    };
++
+     struct layer_state {
+         llama_hot_cache *                    owner;
+         hot_policy                           policy;
+@@ -238,6 +274,14 @@ struct llama_hot_cache {
+         ggml_hot_router_state                gpu_initial{};
+         ggml_hot_router_bridge               gpu_bridge{ &gpu_initial, &gpu_initial };
+         uint64_t                             tokens = 0;
++        // #185: the admission reads and repacks run on the compute threads,
++        // which would otherwise spin at the barrier while one thread reads.
++        std::atomic<uint64_t>                round{ 0 };
++        std::atomic<size_t>                  next_job{ 0 };
++        std::atomic<size_t>                  jobs_done{ 0 };
++        std::vector<read_job>                shared_jobs;
++        std::array<uint64_t, 64>             seen{};
++        bool                                 published = false;
+         std::array<int, 256>                 union_old_slots{}, union_indices{};
+         std::vector<int>                     union_experts, union_old_queue;
+         uint64_t                             union_old_tokens = 0;
+@@ -272,30 +316,42 @@ struct llama_hot_cache {
+ #    else
+             hot_pread_exact(w.fd, staging.data(), w.stride, w.offset + expert * w.stride);
+ #    endif
+-            ggml_backend_tensor_set(w.tensor, staging.data(), slot * w.stride, w.stride);
++            if (w.repack) {
++                ggml_repack_qt_ms32k4_qt2_r(reinterpret_cast<const block_qt_ms32k4 *>(staging.data()),
++                                            reinterpret_cast<block_qt2_r *>(static_cast<unsigned char *>(w.tensor->data) +
++                                                                            slot * w.slot_stride),
++                                            w.stride / sizeof(block_qt_ms32k4));
++                return;
++            }
++            ggml_backend_tensor_set(w.tensor, staging.data(), slot * w.slot_stride, w.stride);
+         }
+     };
+ 
+     // Reused for at most eight admitted experts per decode step.
+     std::array<std::vector<unsigned char>, 3> parallel_staging;
+ 
+-    struct read_job {
+-        weight *        w;
+-        unsigned char * data;
+-        size_t          offset;
+-        size_t          bytes = 0;
+-    };
+-
+     static void read_job_one(void * ctx) {
+         auto &       job   = *static_cast<read_job *>(ctx);
+         size_t       done  = 0;
+         const size_t bytes = job.bytes ? job.bytes : job.w->stride;
++        // A repacking job owns its scratch: the file's bytes never reach a slot.
++        static thread_local std::vector<unsigned char> repack_scratch;
++        unsigned char * data = job.data;
++        if (job.repack_dst) {
++            repack_scratch.resize(bytes);
++            data = repack_scratch.data();
++        }
+ #    if !defined(__APPLE__)
+-        hot_pread_exact(job.w->fd, job.data, bytes, job.offset);
++        hot_pread_exact(job.w->fd, data, bytes, job.offset);
++        if (job.repack_dst) {
++            ggml_repack_qt_ms32k4_qt2_r(reinterpret_cast<const block_qt_ms32k4 *>(data),
++                                        reinterpret_cast<block_qt2_r *>(job.repack_dst),
++                                        bytes / sizeof(block_qt_ms32k4));
++        }
+         return;
+ #    endif
+         while (done < bytes) {
+-            ssize_t n = pread(job.w->fd, job.data + done, bytes - done, job.offset + done);
++            ssize_t n = pread(job.w->fd, data + done, bytes - done, job.offset + done);
+             if (n < 0 && errno == EINTR) {
+                 continue;
+             }
+@@ -304,12 +360,45 @@ struct llama_hot_cache {
+             }
+             done += n;
+         }
++        if (job.repack_dst) {
++            ggml_repack_qt_ms32k4_qt2_r(reinterpret_cast<const block_qt_ms32k4 *>(data),
++                                        reinterpret_cast<block_qt2_r *>(job.repack_dst),
++                                        bytes / sizeof(block_qt_ms32k4));
++        }
+     }
+ 
+     static void read_job_run(void * ctx, size_t index) {
+         read_job_one(&(*static_cast<std::vector<read_job> *>(ctx))[index]);
+     }
+ 
++    // Every compute thread takes jobs until none are left; thread 0 returns
++    // only once all of them are done, so the next node sees every slot filled.
++    // A short pause, not a yield: the scheduler takes milliseconds to hand a
++    // yielded thread its core back, and these waits are tens of microseconds.
++    static void hot_spin_pause() {
++#    if defined(__aarch64__) || defined(__arm__)
++        __asm__ __volatile__("yield" ::: "memory");
++#    elif defined(__x86_64__) || defined(__i386__)
++        __asm__ __volatile__("pause" ::: "memory");
++#    else
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++#    endif
++    }
++
++    static void run_shared_jobs(layer_state & s, int ith) {
++        const size_t count = s.shared_jobs.size();
++        for (size_t i = s.next_job.fetch_add(1, std::memory_order_relaxed); i < count;
++             i = s.next_job.fetch_add(1, std::memory_order_relaxed)) {
++            read_job_one(&s.shared_jobs[i]);
++            s.jobs_done.fetch_add(1, std::memory_order_release);
++        }
++        if (ith == 0) {
++            while (s.jobs_done.load(std::memory_order_acquire) < count) {
++                hot_spin_pause();
++            }
++        }
++    }
++
+     void load_admissions(layer_state & s, const std::vector<std::pair<int, int>> & loads) {
+         if (loads.empty() || s.weights.empty()) {
+             return;
+@@ -320,22 +409,45 @@ struct llama_hot_cache {
+         const uint64_t read_t0 = hot_now_ns();
+         struct read_timer { uint64_t t0; ~read_timer() { g_hot_read_ns += hot_now_ns() - t0; } } read_timer_{ read_t0 };
+         std::vector<read_job> jobs;
++        const bool            repack = s.weights[0]->repack;
+         for (size_t w = 0; w < 3; w++) {
+             auto & weight = *s.weights[w];
+-            parallel_staging[w].resize(weight.stride * loads.size());
++            if (!repack) {
++                parallel_staging[w].resize(weight.stride * loads.size());
++            }
+             for (size_t i = 0; i < loads.size(); i++) {
+                 // The CPU routing split waits for prior GPU work; selected slots
+                 // are not consumed until this callback and every read complete.
+-                unsigned char * dest = parallel_staging[w].data() + i * weight.stride;
+-                jobs.push_back({ &weight, dest, weight.offset + loads[i].first * weight.stride });
++                // Repacked, each reader writes its own slot: nothing is copied twice.
++                read_job job{ &weight, nullptr, weight.offset + loads[i].first * weight.stride };
++                if (repack) {
++                    job.repack_dst =
++                        static_cast<unsigned char *>(weight.tensor->data) + loads[i].second * weight.slot_stride;
++                } else {
++                    job.data = parallel_staging[w].data() + i * weight.stride;
++                }
++                jobs.push_back(job);
+             }
+         }
+-        hot_parallel_for(jobs.size(), &jobs, read_job_run);
++        if (hot_cooperative_reads()) {
++            s.shared_jobs.swap(jobs);
++            s.next_job.store(0, std::memory_order_relaxed);
++            s.jobs_done.store(0, std::memory_order_relaxed);
++            s.published = true;
++            s.round.fetch_add(1, std::memory_order_release); // releases the jobs to the other threads
++            run_shared_jobs(s, 0);
++            jobs.swap(s.shared_jobs);
++        } else {
++            hot_parallel_for(jobs.size(), &jobs, read_job_run);
++        }
++        if (repack) {
++            return;
++        }
+         for (size_t w = 0; w < 3; w++) {
+             for (size_t i = 0; i < loads.size(); i++) {
+                 auto & weight = *s.weights[w];
+                 ggml_backend_tensor_set(weight.tensor, parallel_staging[w].data() + i * weight.stride,
+-                                        loads[i].second * weight.stride, weight.stride);
++                                        loads[i].second * weight.slot_stride, weight.stride);
+             }
+         }
+     }
+@@ -384,13 +496,18 @@ struct llama_hot_cache {
+             auto * scratch = u.matrices[matrix_index(w.tensor)];
+             for (size_t i = 0; i < s.union_experts.size(); ++i) {
+                 int    e    = s.union_experts[i];
+-                auto * dest = static_cast<unsigned char *>(scratch->data) + i * w.stride;
++                auto * dest = static_cast<unsigned char *>(scratch->data) + i * w.slot_stride;
+                 if (s.union_old_slots[e] >= 0) {
+-                    std::memcpy(dest, static_cast<unsigned char *>(w.tensor->data) + s.union_old_slots[e] * w.stride,
+-                                w.stride);
++                    std::memcpy(dest,
++                                static_cast<unsigned char *>(w.tensor->data) + s.union_old_slots[e] * w.slot_stride,
++                                w.slot_stride);
+                 } else {
+                     const size_t offset = w.offset + e * w.stride;
+-                    jobs.push_back({ &w, dest, offset, w.stride });
++                    read_job     job{ &w, w.repack ? nullptr : dest, offset, w.stride };
++                    if (w.repack) {
++                        job.repack_dst = dest;
++                    }
++                    jobs.push_back(job);
+                 }
+             }
+         }
+@@ -413,8 +530,9 @@ struct llama_hot_cache {
+                 for (auto & wp : s.weights) {
+                     auto & w       = *wp;
+                     auto * scratch = u.matrices[matrix_index(w.tensor)];
+-                    std::memcpy(static_cast<unsigned char *>(w.tensor->data) + s.policy.slots[e] * w.stride,
+-                                static_cast<unsigned char *>(scratch->data) + s.union_indices[e] * w.stride, w.stride);
++                    std::memcpy(static_cast<unsigned char *>(w.tensor->data) + s.policy.slots[e] * w.slot_stride,
++                                static_cast<unsigned char *>(scratch->data) + s.union_indices[e] * w.slot_stride,
++                                w.slot_stride);
+                 }
+             }
+         }
+@@ -430,10 +548,36 @@ struct llama_hot_cache {
+         std::memcpy(dst->data, src->data, ggml_nbytes(src));
+     }
+ 
+-    static void route_op(ggml_tensor * dst, int ith, int, void * ud) {
++    static void route_op(ggml_tensor * dst, int ith, int nth, void * ud) {
+         if (ith) {
++            if (!hot_cooperative_reads() || (size_t) ith >= static_cast<layer_state *>(ud)->seen.size()) {
++                return;
++            }
++            // Wait for this step's admissions to be published, then take jobs.
++            auto &         s    = *static_cast<layer_state *>(ud);
++            const uint64_t mine = s.seen[ith];
++            while (s.round.load(std::memory_order_acquire) == mine) {
++                hot_spin_pause();
++            }
++            s.seen[ith] = mine + 1;
++            run_shared_jobs(s, ith);
+             return;
+         }
++        GGML_ASSERT(nth <= 64);
++        // Whatever this step does, the round is published exactly once: the
++        // other threads are waiting on it.
++        struct round_guard {
++            layer_state & s;
++            ~round_guard() {
++                if (!s.published && hot_cooperative_reads()) {
++                    s.shared_jobs.clear();
++                    s.next_job.store(0, std::memory_order_relaxed);
++                    s.jobs_done.store(0, std::memory_order_relaxed);
++                    s.round.fetch_add(1, std::memory_order_release);
++                }
++                s.published = false;
++            }
++        } round_guard_{ *static_cast<layer_state *>(ud) };
+         struct route_timer { uint64_t t0 = hot_now_ns(); ~route_timer() { g_hot_route_ns += hot_now_ns() - t0; g_hot_route_calls++; } } route_timer_;
+         const auto * src = dst->src[0];
+         GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == 256 && ggml_nrows(src) == src->ne[1]);
+@@ -530,7 +674,14 @@ struct llama_hot_cache {
+         w->tensor = tensor;
+         w->fd     = dup(fd);
+         w->offset = offset;
+-        w->stride = stride;
++        w->stride      = stride;
++        w->slot_stride = tensor->nb[2];
++        w->repack      = tensor->type == GGML_TYPE_QT2_R;
++        if (w->repack) {
++            GGML_ASSERT(stride % sizeof(block_qt_ms32k4) == 0 &&
++                        w->slot_stride == stride / sizeof(block_qt_ms32k4) * sizeof(block_qt2_r));
++            GGML_ASSERT(ggml_backend_buffer_is_host(tensor->buffer));
++        }
+         if (w->fd < 0) {
+             throw std::runtime_error("dup failed");
+         }
+@@ -552,7 +703,7 @@ struct llama_hot_cache {
+             w->fd = direct;
+         }
+ #    endif
+-        GGML_ASSERT(tensor->ne[2] == llama_hot_capacity() && tensor->nb[2] == stride);
++        GGML_ASSERT(tensor->ne[2] == llama_hot_capacity() && (w->repack || tensor->nb[2] == stride));
+         for (int e : s.policy.queue) {
+             s.load(*w, e, s.policy.slots[e]);
+         }
+@@ -561,7 +712,8 @@ struct llama_hot_cache {
+ 
+     ggml_tensor * llama_hot_route(ggml_context * ctx, ggml_tensor * logits, int il) {
+         ggml_tensor * args[] = { logits };
+-        auto * out = ggml_custom_4d(ctx, GGML_TYPE_I32, 16, logits->ne[1], 1, 1, args, 1, route_op, 1, &state(il));
++        auto * out = ggml_custom_4d(ctx, GGML_TYPE_I32, 16, logits->ne[1], 1, 1, args, 1, route_op,
++                                    hot_cooperative_reads() ? GGML_N_TASKS_MAX : 1, &state(il));
+         // Marker stored after the custom operation parameters.
+         if (gpu_routing) {
+             out->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0x484f5431;
+@@ -759,6 +911,10 @@ void llama_hot_bind(llama_hot_cache * cache, ggml_tensor * tensor, int fd, size_
+     cache->llama_hot_bind(tensor, fd, offset, stride);
+ }
+ 
++ggml_type llama_hot_slot_type(const llama_hot_cache *, ggml_type file_type) {
++    return hot_repack_experts() && file_type == GGML_TYPE_QT_MS32K4 ? GGML_TYPE_QT2_R : file_type;
++}
++
+ ggml_tensor * llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer) {
+     return cache->llama_hot_route(ctx, logits, layer);
+ }
+@@ -810,6 +966,10 @@ void llama_hot_bind(llama_hot_cache *, ggml_tensor *, int, size_t, size_t) {
+     throw std::runtime_error("hot experts require the Metal backend");
+ }
+ 
++ggml_type llama_hot_slot_type(const llama_hot_cache *, ggml_type file_type) {
++    return file_type;
++}
++
+ ggml_tensor * llama_hot_route(llama_hot_cache *, ggml_context *, ggml_tensor *, int) {
+     throw std::runtime_error("hot experts require the Metal backend");
+ }
+diff --git a/src/llama-hot-cache.h b/src/llama-hot-cache.h
+index 431e2f9..f6d8a0c 100644
+--- a/src/llama-hot-cache.h
++++ b/src/llama-hot-cache.h
+@@ -14,6 +14,9 @@ int               llama_hot_capacity(const llama_hot_cache * cache);
+ void              llama_hot_attach_context(llama_hot_cache * cache);
+ void              llama_hot_detach_context(llama_hot_cache * cache);
+ void              llama_hot_bind(llama_hot_cache * cache, ggml_tensor * tensor, int fd, size_t offset, size_t stride);
++// The type the slots hold: the file's, or QT2_R when this build repacks
++// ternary experts as it admits them (#185).
++ggml_type         llama_hot_slot_type(const llama_hot_cache * cache, ggml_type file_type);
+ ggml_tensor *     llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer);
+ ggml_tensor *     llama_hot_union_weight(llama_hot_cache * cache, ggml_tensor * original, int layer);
+ ggml_tensor *     llama_hot_union_finish(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * cur, int layer);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 554ec60..d32186c 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1292,7 +1292,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         if (use_mmap || cur->ne[2] != 256 || cur->ne[3] != 1) {
+             throw std::runtime_error("hot cache requires --no-mmap and 256 experts");
+         }
+-        tensor = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], llama_hot_capacity(hot_cache));
++        tensor = ggml_new_tensor_3d(ctx, llama_hot_slot_type(hot_cache, cur->type), cur->ne[0], cur->ne[1],
++                                    llama_hot_capacity(hot_cache));
+     } else {
+         tensor = ggml_dup_tensor(ctx, cur);
+     }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 99b8073..ee1a4cf 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -256,6 +256,7 @@ if (NOT GGML_BACKEND_DL)
+     # these tests use the backends directly and cannot be built with dynamic loading
+     llama_build_and_test(test-barrier.cpp)
+     llama_build_and_test(test-quantize-fns.cpp)
++    llama_build(test-millie-qt2r.cpp)
+     llama_build_and_test(test-quantize-perf.cpp)
+     llama_build_and_test(test-ternary-dot.cpp)
+     target_link_libraries(test-ternary-dot PRIVATE ${CMAKE_DL_LIBS})
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8301d35..a9987b5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9149,6 +9149,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     for (int64_t n : { 1, 32, 64, 128, 256, 512 }) {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT2_R,     GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT2_R,     GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
+     }
+ 
+     return test_cases;
+diff --git a/tests/test-millie-qt2r.cpp b/tests/test-millie-qt2r.cpp
+new file mode 100644
+index 0000000..58bc2fe
+--- /dev/null
++++ b/tests/test-millie-qt2r.cpp
+@@ -0,0 +1,101 @@
++// #185: QT2_R (QT_MS32K4 repacked as 2-bit codes) must give the CPU backend
++// the same bytes as the original: dequantization, mul_mat at every column
++// count (GEMV and tiles) and mul_mat_id at Millie's expert shape.
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "../ggml/src/ggml-quants.h"
++
++#include <cstdio>
++#include <algorithm>
++#include <cstring>
++#include <random>
++#include <vector>
++
++static void fill_random(float * x, size_t n, std::mt19937 & rng) {
++    std::normal_distribution<float> dist(0.0f, 1.0f);
++    for (size_t i = 0; i < n; ++i) x[i] = dist(rng);
++}
++
++static bool same(const ggml_tensor * a, const ggml_tensor * b, const char * what) {
++    const bool ok = ggml_nbytes(a) == ggml_nbytes(b) && memcmp(a->data, b->data, ggml_nbytes(a)) == 0;
++    printf("%-44s %s\n", what, ok ? "identical" : "DIFFERS");
++    return ok;
++}
++
++int main() {
++    std::mt19937 rng(185);
++    const int64_t K = 2048, M = 512, E = 16, USED = 4;
++    ggml_init_params params = { size_t(1) << 30, nullptr, false };
++    ggml_context * ctx = ggml_init(params);
++    bool ok = true;
++
++    // One expert stack in both layouts.
++    std::vector<float> w(K * M * E);
++    fill_random(w.data(), w.size(), rng);
++    ggml_tensor * a0 = ggml_new_tensor_3d(ctx, GGML_TYPE_QT_MS32K4, K, M, E);
++    ggml_tensor * a1 = ggml_new_tensor_3d(ctx, GGML_TYPE_QT2_R, K, M, E);
++    ggml_quantize_chunk(GGML_TYPE_QT_MS32K4, w.data(), a0->data, 0, M * E, K, nullptr);
++    ggml_repack_qt_ms32k4_qt2_r((const block_qt_ms32k4 *) a0->data, (block_qt2_r *) a1->data, K * M * E / 256);
++
++    std::vector<float> d0(K * M), d1(K * M);
++    dequantize_row_qt_ms32k4((const block_qt_ms32k4 *) a0->data, d0.data(), K * M);
++    dequantize_row_qt2_r((const block_qt2_r *) a1->data, d1.data(), K * M);
++    const bool deq = memcmp(d0.data(), d1.data(), d0.size() * sizeof(float)) == 0;
++    printf("%-44s %s\n", "dequantize", deq ? "identical" : "DIFFERS");
++    ok &= deq;
++
++    ggml_tensor * m0 = ggml_view_2d(ctx, a0, K, M, a0->nb[1], 0);
++    ggml_tensor * m1 = ggml_view_2d(ctx, a1, K, M, a1->nb[1], 0);
++    for (int64_t n : { 1, 2, 3, 5, 8, 17, 64, 512 }) {
++        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n);
++        fill_random((float *) b->data, K * n, rng);
++        ggml_tensor * c0 = ggml_mul_mat(ctx, m0, b);
++        ggml_tensor * c1 = ggml_mul_mat(ctx, m1, b);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, c0);
++        ggml_build_forward_expand(gf, c1);
++        ggml_graph_compute_with_ctx(ctx, gf, 4);
++        char what[64];
++        snprintf(what, sizeof(what), "mul_mat n=%lld", (long long) n);
++        ok &= same(c0, c1, what);
++    }
++
++    for (int64_t n : { 1, 7, 64, 512 }) {
++        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n);
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, USED, n);
++        fill_random((float *) b->data, K * n, rng);
++        for (int64_t t = 0; t < n; ++t) {
++            std::vector<int> perm(E);
++            for (int e = 0; e < E; ++e) perm[e] = e;
++            std::shuffle(perm.begin(), perm.end(), rng);
++            for (int u = 0; u < USED; ++u) ((int32_t *) ids->data)[t * USED + u] = perm[u];
++        }
++        ggml_tensor * c0 = ggml_mul_mat_id(ctx, a0, b, ids);
++        ggml_tensor * c1 = ggml_mul_mat_id(ctx, a1, b, ids);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, c0);
++        ggml_build_forward_expand(gf, c1);
++        ggml_graph_compute_with_ctx(ctx, gf, 4);
++        char what[64];
++        snprintf(what, sizeof(what), "mul_mat_id %lld experts x %lld tokens", (long long) E, (long long) n);
++        ok &= same(c0, c1, what);
++    }
++
++    {   // How long one expert matrix (2048 x 512) takes to repack, the cost the
++        // cache pays on every admission.
++        const int64_t blocks = K * M / 256;
++        std::vector<uint8_t> dst(blocks * sizeof(block_qt2_r));
++        const int64_t t0 = ggml_time_us();
++        const int reps = 20;
++        for (int r = 0; r < reps; ++r) {
++            ggml_repack_qt_ms32k4_qt2_r((const block_qt_ms32k4 *) a0->data, (block_qt2_r *) dst.data(), blocks);
++        }
++        const double ms = (ggml_time_us() - t0) / 1000.0 / reps;
++        printf("repack %lld blocks (%.1f MB of weights): %.2f ms, %.2f G weights/s\n",
++               (long long) blocks, blocks * 54 / 1e6, ms, blocks * 256 / ms / 1e6);
++    }
++
++    ggml_free(ctx);
++    printf("%s\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}

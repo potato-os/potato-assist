@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:12:36 +0100
+Subject: [PATCH] cpu: the dense one-token GEMV prepares its column on every
+ thread (#190)
+
+Thread 0 alone quantized and laid out the decoded token's column for each
+interleaved 4-bit matmul while the other four waited. Each thread now
+prepares its share of the column's 128-blocks, with the same per-block code,
+so the column is byte-identical.
+
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index dc72031..121f384 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4802,8 +4802,12 @@ class q4_sym16k_x4_traits : public tensor_traits_base {
+         };
+ 
+         if (ncols == 1) {
+-            if (ith == 0) {
+-                ggml_q4_sym16k_x4_col((const float *) col_of(src1, 0), wdata, ne10);
++            // #190: every thread prepares its share of the column's 128-blocks
++            const int64_t nblk = ne10 / QK4_SYM16K;
++            const int64_t b0 = nblk * ith / nth, b1 = nblk * (ith + 1) / nth;
++            if (b1 > b0) {
++                ggml_q4_sym16k_x4_col((const float *) col_of(src1, 0) + b0 * QK4_SYM16K,
++                                      wdata + b0 * (csize / nblk), (b1 - b0) * QK4_SYM16K);
+             }
+         } else {
+             const ggml_from_float_t from_float = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;

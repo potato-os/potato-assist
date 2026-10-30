@@ -1,0 +1,35 @@
+Subject: [PATCH] lora: allow adapters with hot experts unless they adapt routed experts
+
+Hot experts manage only the routed experts (*_exps). Adapters for the other weights (attention,
+delta net, shared expert) go through build_lora_mm as usual, so refuse only adapters with *_exps tensors.
+---
+--- a/src/llama-adapter.cpp	2026-10-27 10:28:48
++++ b/src/llama-adapter.cpp	2026-10-27 10:28:48
+@@ -312,6 +312,16 @@
+             while (extra_bufts && *extra_bufts) {
+                 buft_extra.emplace_back(*extra_bufts);
+                 ++extra_bufts;
++            }
++        }
++    }
++
++    // Hot experts read the routed experts' weights themselves, outside the graph's LoRA path. An adapter that
++    // leaves them alone (attention, delta net, shared expert) goes through build_lora_mm like any other model.
++    if (model.hot_cache) {
++        for (const auto & it : ab_map) {
++            if (it.first.find("_exps") != std::string::npos) {
++                throw std::runtime_error("LoRA tensor '" + it.first + "' adapts routed experts, which hot experts do not support");
+             }
+         }
+     }
+@@ -418,10 +428,6 @@
+ }
+ 
+ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
+-    if (model->hot_cache) {
+-        LLAMA_LOG_ERROR("%s: LoRA is not supported with hot experts\n", __func__);
+-        return nullptr;
+-    }
+     llama_adapter_lora * adapter = new llama_adapter_lora(model);
+ 
+     try {

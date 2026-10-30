@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 22:35:51 +0100
+Subject: [PATCH] metal: batch short rows in CPY again (#185, upstream's fix)
+
+The copy op clamped its threadgroup width to the row length before testing
+whether rows could be batched, so they never were: the recurrent conv state
+(three floats per channel, 30 layers per token) went out as one threadgroup
+of three threads per row, 2.2-2.3 ms of the A19's step (#183). Starting from
+the rows' combined width batches 85 rows per threadgroup; the copy kernels
+now stop rows past the end, which a partial last threadgroup can reach.
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 3efec84..c238001 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1925,7 +1925,11 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+         nk0 = ne00/ggml_blck_size(op->type);
+     }
+ 
+-    int nth = std::min<int>(nk0, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++    // #185 (upstream's fix): start from the rows' combined width, or nth is
++    // already nk0 and short rows are never batched. The recurrent conv state
++    // (three floats per channel) took one threadgroup of three threads per row.
++    const int max_nth = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++    int nth = std::min<int>(nk0*ne01, max_nth);
+ 
+     // when rows are small, we can batch them together in a single threadgroup
+     int nrptg = 1;
+@@ -1936,7 +1940,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+             nrptg = (nth + nk0 - 1)/nk0;
+             nth   = nk0;
+ 
+-            if (nrptg*nth > ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
++            if (nrptg*nth > max_nth) {
+                 nrptg--;
+             }
+         }
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 7913b12..968d2a1 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -7607,6 +7607,10 @@ kernel void kernel_cpy_t_t(
+     const int i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tiitg/ntg[0];
+     const int iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+ 
++    if (i01 >= args.ne01) {
++        return; // #185: the last threadgroup of batched rows can run past the end
++    }
++
+     const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+ 
+     const int64_t i3 = n/(args.ne2*args.ne1*args.ne0);
+@@ -7655,6 +7659,10 @@ kernel void kernel_cpy_f32_q(
+     const int i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tiitg/ntg[0];
+     const int iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+ 
++    if (i01 >= args.ne01) {
++        return; // #185: the last threadgroup of batched rows can run past the end
++    }
++
+     const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+ 
+     const int64_t i3 = n / (args.ne2*args.ne1*args.ne0);
+@@ -7696,6 +7704,10 @@ kernel void kernel_cpy_q_f32(
+     const int i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tiitg/ntg[0];
+     const int iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+ 
++    if (i01 >= args.ne01) {
++        return; // #185: the last threadgroup of batched rows can run past the end
++    }
++
+     const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+ 
+     const int64_t i3 = n/(args.ne2*args.ne1*args.ne0);

@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:46:15 +0100
+Subject: [PATCH] cpu: i8mm (smmla) tiles for Q4_SYM16K x4 and QT2_R4, chosen
+ at run time, bit-identical (#190)
+
+smmla multiplies two rows by two columns over 8 k at once, 32 MACs where
+sdot does 16. The interleaved 4-bit tile and the QT2_R4 group kernel get an
+smmla path for two or more columns: the same integer products give the same
+sub-block sums, which are transposed back into each tile's (row, column)
+lanes, and the float stage is the tile's own. The path is compiled with a
+function-level i8mm target and taken only when HWCAP2_I8MM is set
+(MILLIE_I8MM=0 turns it off), so dotprod-only phones keep the sdot tiles.
+test-millie-qt2r passes on the 12R with i8mm live.
+
+12R pp512: 28.77 without, 29.21 with (two rounds): prefill is not tile-bound.
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 3fa3c05..940cc45 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -971,6 +971,73 @@ static inline __attribute__((always_inline)) void qt2_r4_group(
+     for (int c = 0; c < NC; ++c) out[c] = sum[c];
+ }
+ 
++static int millie_has_i8mm(void);
++
++// #190: i8mm for QT2_R4 at two or four columns: rows (2p, 2p+1) by 8 k of
++// codes against columns (2q, 2q+1). Two shift planes zip into one operand;
++// the 2 x 2 results unzip into the rows-in-lanes vectors, and from there it is
++// qt2_r4_group's float stage, in its order.
++__attribute__((target("i8mm")))
++static void qt2_r4_group_mm(const int NC, const int nb, const block_qt2_r4 * GGML_RESTRICT x,
++        const block_q8_0 * const * GGML_RESTRICT ys, const qt2_r4_col * GGML_RESTRICT ps, float32x4_t * GGML_RESTRICT out) {
++    const uint8x16_t m3 = vdupq_n_u8(3), m15 = vdupq_n_u8(15);
++    float32x4_t sum[QT2_R4_NC];
++    for (int c = 0; c < NC; ++c) sum[c] = vdupq_n_f32(0.0f);
++    for (int i = 0; i < nb; ++i) {
++        const block_qt2_r4 * GGML_RESTRICT b = x + i;
++        const float32x4_t dv = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b->d)));
++        const uint8x16_t S = vld1q_u8(b->scales);
++        const uint8x16_t Slo = vandq_u8(S, m15), Shi = vshrq_n_u8(S, 4);
++        const uint16x8_t lo0 = vmovl_u8(vget_low_u8(Slo)), lo1 = vmovl_high_u8(Slo);
++        const uint16x8_t hi0 = vmovl_u8(vget_low_u8(Shi)), hi1 = vmovl_high_u8(Shi);
++        int32x4_t sc[QKT_MS32K_SUPER];
++        sc[0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo0))); sc[1] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi0)));
++        sc[2] = vreinterpretq_s32_u32(vmovl_high_u16(lo0));          sc[3] = vreinterpretq_s32_u32(vmovl_high_u16(hi0));
++        sc[4] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo1))); sc[5] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi1)));
++        sc[6] = vreinterpretq_s32_u32(vmovl_high_u16(lo1));          sc[7] = vreinterpretq_s32_u32(vmovl_high_u16(hi1));
++        float32x4_t a[QT2_R4_NC][4];
++        for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++            // A[h][s2][p]: rows 2p, 2p+1 by weights 16h + 8*s2 .. + 7 (codes)
++            int8x16_t A[2][2][2];
++            for (int h = 0; h < 2; ++h) {
++                const uint8x16_t Q = vld1q_u8(b->qs + 32*sb + 16*h);
++                const uint32x4_t V0 = vreinterpretq_u32_u8(vandq_u8(Q, m3));
++                const uint32x4_t V1 = vreinterpretq_u32_u8(vandq_u8(vshrq_n_u8(Q, 2), m3));
++                const uint32x4_t V2 = vreinterpretq_u32_u8(vandq_u8(vshrq_n_u8(Q, 4), m3));
++                const uint32x4_t V3 = vreinterpretq_u32_u8(vshrq_n_u8(Q, 6));
++                A[h][0][0] = vreinterpretq_s8_u32(vzip1q_u32(V0, V1)); A[h][0][1] = vreinterpretq_s8_u32(vzip2q_u32(V0, V1));
++                A[h][1][0] = vreinterpretq_s8_u32(vzip1q_u32(V2, V3)); A[h][1][1] = vreinterpretq_s8_u32(vzip2q_u32(V2, V3));
++            }
++            for (int cp = 0; cp < NC / 2; ++cp) {
++                const int8_t * y0 = ys[2*cp][i*QKT_MS32K_SUPER + sb].qs;
++                const int8_t * y1 = ys[2*cp + 1][i*QKT_MS32K_SUPER + sb].qs;
++                int32x4_t acc[2] = { vdupq_n_s32(0), vdupq_n_s32(0) };
++                for (int h = 0; h < 2; ++h) {
++                    for (int s2 = 0; s2 < 2; ++s2) {
++                        const int k = 16*h + 8*s2;
++                        const int8x16_t B = vcombine_s8(vld1_s8(y0 + k), vld1_s8(y1 + k));
++                        acc[0] = vmmlaq_s32(acc[0], A[h][s2][0], B);
++                        acc[1] = vmmlaq_s32(acc[1], A[h][s2][1], B);
++                    }
++                }
++                // rows in lanes, per column: [r0 r1 r2 r3] = lanes (c, 2 + c) of the two pairs
++                const int32x4_t col[2] = { vuzp1q_s32(acc[0], acc[1]), vuzp2q_s32(acc[0], acc[1]) };
++                for (int cc = 0; cc < 2; ++cc) {
++                    const int c = 2*cp + cc;
++                    const int32x4_t s0 = vaddq_s32(vld1q_dup_s32(&ps[c].nys[i*QKT_MS32K_SUPER + sb]), col[cc]);
++                    const float32x4_t gs = vcvtq_f32_s32(vmulq_s32(s0, sc[sb]));
++                    const float       d8 = ps[c].d8[i*QKT_MS32K_SUPER + sb];
++                    a[c][sb & 3] = sb < 4 ? vmulq_n_f32(gs, d8) : vfmaq_n_f32(a[c][sb & 3], gs, d8);
++                }
++            }
++        }
++        for (int c = 0; c < NC; ++c) {
++            sum[c] = vfmaq_f32(sum[c], dv, vaddq_f32(vaddq_f32(a[c][0], a[c][1]), vaddq_f32(a[c][2], a[c][3])));
++        }
++    }
++    for (int c = 0; c < NC; ++c) out[c] = sum[c];
++}
++
+ #define QT2_R4_GROUP_FN(NC) \
+     static void qt2_r4_group_##NC(int nb, const block_qt2_r4 * x, const block_q8_0 * const * ys, const qt2_r4_col * ps, float32x4_t * out) { \
+         qt2_r4_group(NC, nb, x, ys, ps, out); \
+@@ -989,9 +1056,14 @@ void ggml_gemm_qt2_r4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, co
+     for (int c0 = 0; c0 < nc; c0 += QT2_R4_NC) {
+         const int kc = nc - c0 < QT2_R4_NC ? nc - c0 : QT2_R4_NC;
+         for (int c = 0; c < kc; ++c) qt2_r4_prep(ys[c0 + c], nb, &ps[c]);
++        const bool mm = (kc == 2 || kc == 4) && millie_has_i8mm();
+         for (int g = 0; g < nr / 4; ++g) {
+             float32x4_t out[QT2_R4_NC];
+-            groups[kc - 1](nb, (const block_qt2_r4 *) vx + (size_t) g * nb, ys + c0, ps, out);
++            if (mm) {
++                qt2_r4_group_mm(kc, nb, (const block_qt2_r4 *) vx + (size_t) g * nb, ys + c0, ps, out);
++            } else {
++                groups[kc - 1](nb, (const block_qt2_r4 *) vx + (size_t) g * nb, ys + c0, ps, out);
++            }
+             for (int c = 0; c < kc; ++c) vst1q_f32(dst[c0 + c] + 4*g, out[c]);
+         }
+     }
+@@ -1189,6 +1261,111 @@ static inline __attribute__((always_inline)) void q4_sym16k_x4_q8_0_tile(
+     }
+ MILLIE_X4_TILE_FN(1) MILLIE_X4_TILE_FN(2) MILLIE_X4_TILE_FN(4) MILLIE_X4_TILE_FN(8)
+ 
++#if defined(__linux__) && defined(__aarch64__)
++#include <sys/auxv.h>
++#endif
++
++// #190: i8mm (smmla) for the interleaved tiles, chosen at run time on cores
++// that have it. smmla multiplies two rows by two columns over 8 k at once: the
++// same integer products the sdot tiles form, so each sub-block's integer sum
++// is the same, and the float stage below is the tile's own, in its order.
++static int millie_has_i8mm(void) {
++    static atomic_int has = -1;
++    int v = atomic_load_explicit(&has, memory_order_relaxed);
++    if (v < 0) {
++        v = 0;
++#if defined(__linux__) && defined(__aarch64__)
++        v = (getauxval(AT_HWCAP2) & (1UL << 13)) != 0; // HWCAP2_I8MM
++#endif
++        const char * e = getenv("MILLIE_I8MM");
++        if (e && atoi(e) == 0) v = 0;
++        atomic_store_explicit(&has, v, memory_order_relaxed);
++    }
++    return v;
++}
++
++static inline __attribute__((always_inline)) void millie_transpose4_s32(const int32x4_t in[4], int32x4_t out[4]) {
++    const int32x4_t t0 = vtrn1q_s32(in[0], in[1]), t1 = vtrn2q_s32(in[0], in[1]);
++    const int32x4_t t2 = vtrn1q_s32(in[2], in[3]), t3 = vtrn2q_s32(in[2], in[3]);
++    out[0] = vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
++    out[1] = vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
++    out[2] = vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
++    out[3] = vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
++}
++
++// NR columns (even, at most 8) of four interleaved rows.
++__attribute__((target("i8mm")))
++static void q4_sym16k_x4_q8_0_tile_mm(const int NR, const int nb, const block_q4_sym16k_x4 * GGML_RESTRICT x,
++        const block_q8_0 * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    static const int8_t  klut[16] = { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 };
++    static const uint8_t kidx[32] = { 0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29,
++                                      2, 6, 10, 14, 18, 22, 26, 30, 3, 7, 11, 15, 19, 23, 27, 31 };
++    const int8x16_t  lut = vld1q_s8(klut);
++    const uint8x16_t m4b = vdupq_n_u8(0x0F);
++    const uint8x16_t i01 = vld1q_u8(kidx), i23 = vld1q_u8(kidx + 16);
++
++    float sums[4][MILLIE_TILE_NR_MAX];
++    for (int r = 0; r < 4; ++r) for (int c = 0; c < NR; ++c) sums[r][c] = 0.0f;
++
++    for (int i = 0; i < nb; ++i) {
++        const block_q4_sym16k_x4 * GGML_RESTRICT b = x + i;
++        // A[j][h][p]: rows 2p, 2p+1 by weights 16j + 8h .. + 7, as values 2q - 15
++        int8x16_t A[QK4_SYM16K_SUPER][2][2];
++        for (int j = 0; j < QK4_SYM16K_SUPER; ++j) {
++            for (int h = 0; h < 2; ++h) {
++                const uint8x16_t v  = vld1q_u8(b->qs + 32*j + 16*h);
++                const int8x16_t  lo = vqtbl1q_s8(lut, vandq_u8(v, m4b));
++                const int8x16_t  hi = vqtbl1q_s8(lut, vshrq_n_u8(v, 4));
++                A[j][h][0] = vzip1q_s8(lo, hi);
++                A[j][h][1] = vzip2q_s8(lo, hi);
++            }
++        }
++        float32x4_t sc0[4], sc1[4];
++        float       d[4];
++        const uint8x16x2_t S = { { vld1q_u8((const uint8_t *) b->scales), vld1q_u8((const uint8_t *) b->scales + 16) } };
++        const int8x16_t R01 = vreinterpretq_s8_u8(vqtbl2q_u8(S, i01)), R23 = vreinterpretq_s8_u8(vqtbl2q_u8(S, i23));
++        const int16x8_t sc16[4] = { vmovl_s8(vget_low_s8(R01)), vmovl_high_s8(R01), vmovl_s8(vget_low_s8(R23)), vmovl_high_s8(R23) };
++        for (int r = 0; r < 4; ++r) {
++            sc0[r] = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sc16[r])));
++            sc1[r] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sc16[r])));
++            d[r]   = GGML_CPU_FP16_TO_FP32(b->d[r]);
++        }
++        for (int cp = 0; cp < NR / 2; ++cp) {
++            const block_q8_0 * GGML_RESTRICT y0 = ys[2*cp]     + 4*i;
++            const block_q8_0 * GGML_RESTRICT y1 = ys[2*cp + 1] + 4*i;
++            int32x4_t acc[2][QK4_SYM16K_SUPER];
++            for (int j = 0; j < QK4_SYM16K_SUPER; ++j) {
++                const int off = 16*(j & 1);
++                const int8x16_t B0 = vcombine_s8(vld1_s8(y0[j/2].qs + off),     vld1_s8(y1[j/2].qs + off));
++                const int8x16_t B1 = vcombine_s8(vld1_s8(y0[j/2].qs + off + 8), vld1_s8(y1[j/2].qs + off + 8));
++                for (int p = 0; p < 2; ++p) {
++                    acc[p][j] = vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0), A[j][0][p], B0), A[j][1][p], B1);
++                }
++            }
++            float d8h[2][4];
++            for (int t = 0; t < 4; ++t) {
++                d8h[0][t] = 0.5f * GGML_CPU_FP16_TO_FP32(y0[t].d);
++                d8h[1][t] = 0.5f * GGML_CPU_FP16_TO_FP32(y1[t].d);
++            }
++            for (int p = 0; p < 2; ++p) {
++                int32x4_t g0[4], g1[4]; // [lane of the 2x2 result]: subs 0..3, 4..7
++                millie_transpose4_s32(&acc[p][0], g0);
++                millie_transpose4_s32(&acc[p][4], g1);
++                for (int L = 0; L < 4; ++L) {
++                    const int r = 2*p + L/2, cc = L & 1, c = 2*cp + cc;
++                    const float32x4_t d80 = { d8h[cc][0], d8h[cc][0], d8h[cc][1], d8h[cc][1] };
++                    const float32x4_t d81 = { d8h[cc][2], d8h[cc][2], d8h[cc][3], d8h[cc][3] };
++                    float32x4_t accv = vdupq_n_f32(0.0f);
++                    accv = vfmaq_f32(accv, vcvtq_f32_s32(g0[L]), vmulq_f32(sc0[r], d80));
++                    accv = vfmaq_f32(accv, vcvtq_f32_s32(g1[L]), vmulq_f32(sc1[r], d81));
++                    sums[r][c] += d[r] * vaddvq_f32(accv);
++                }
++            }
++        }
++    }
++    for (int c = 0; c < NR; ++c) for (int r = 0; r < 4; ++r) dst[c][r0 + r] = sums[r][c];
++}
++
+ void ggml_gemm_q4_sym16k_x4(int64_t n, int64_t nrows, int nc, const void * GGML_RESTRICT vx, const void * const * vy, float * const * dst) {
+     typedef void (*tile_fn)(int, const block_q4_sym16k_x4 *, const block_q8_0 * const *, float * const *, int);
+     static const tile_fn tiles[8] = { q4_sym16k_x4_q8_0_tile_1, q4_sym16k_x4_q8_0_tile_2, NULL, q4_sym16k_x4_q8_0_tile_4,
+@@ -1198,10 +1375,15 @@ void ggml_gemm_q4_sym16k_x4(int64_t n, int64_t nrows, int nc, const void * GGML_
+     const int nr = (v >> 4) > 0 ? (v & 15) : 1;
+     const int nb = (int) (n / QK4_SYM16K);
+     const block_q8_0 * const * ys = (const block_q8_0 * const *) vy;
++    const bool mm = millie_has_i8mm();
+     for (int c = 0; c < nc;) {
+         const int kc = millie_fit(nr, nc - c);
+         for (int64_t g = 0; g < nrows / 4; ++g) {
+-            tiles[kc - 1](nb, (const block_q4_sym16k_x4 *) vx + g*nb, ys + c, dst + c, (int) (4*g));
++            if (mm && kc >= 2) {
++                q4_sym16k_x4_q8_0_tile_mm(kc, nb, (const block_q4_sym16k_x4 *) vx + g*nb, ys + c, dst + c, (int) (4*g));
++            } else {
++                tiles[kc - 1](nb, (const block_q4_sym16k_x4 *) vx + g*nb, ys + c, dst + c, (int) (4*g));
++            }
+         }
+         c += kc;
+     }

@@ -1,0 +1,34 @@
+name: Potato Assist
+version: "0.1.0"
+slug: potato_assist
+description: A local LLM for Home Assistant's Assist, running on your Raspberry Pi 5. From Potato OS.
+url: https://github.com/potato-os/potato-assist
+image: ghcr.io/potato-os/potato-assist
+arch:
+  - aarch64
+init: false
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8080
+panel_icon: mdi:chip
+panel_title: Potato Assist
+# Read-only use: checks whether a commanded entity is unavailable before the model reports success.
+homeassistant_api: true
+# Home Assistant reaches the API over the internal network (http://<hostname>:8080), so the LAN port is off by default.
+ports:
+  8080/tcp: null
+ports_description:
+  8080/tcp: Chat UI, OpenAI-compatible API (/v1) and Ollama-compatible API (/api), without authentication
+# Models are stored in /share/potato-assist/models.
+map:
+  - type: share
+    read_only: false
+# Firmware mailbox for vcgencmd-style telemetry: real throttle flags, measured ARM clock, PMIC power.
+devices:
+  - /dev/vcio
+  - /dev/vcio_gencmd
+options:
+  default_model: lfm3-1.7b-home-assistant
+schema:
+  default_model: list(lfm3-1.7b-home-assistant|lfm3-vl-2b|bonsai-2-2b|millie-1.1)

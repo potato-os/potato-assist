@@ -1,0 +1,34 @@
+diff --git a/examples/server/server-common.cpp b/examples/server/server-common.cpp
+index 21fcd3f..a8fd013 100644
+--- a/examples/server/server-common.cpp
++++ b/examples/server/server-common.cpp
+@@ -1364,8 +1364,10 @@ llama_tokens server_tokens::tokens_data() {
+ 
+ // for compatibility with speculative decoding, ctx shift, slot save/load
+ const std::vector<llama_token>& server_tokens::get_text_tokens() const {
+-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+-    return tokens;
++    // pi-llm: with a vision projector loaded, text-only contexts still have a plain token stream; contexts that
++    // hold an image return nothing, so self-speculative drafting simply finds no match there.
++    static const std::vector<llama_token> no_tokens;
++    return map_idx_to_media.empty() ? tokens : no_tokens;
+ }
+ 
+ // for compatibility with speculative decoding
+diff --git a/examples/server/server-context.cpp b/examples/server/server-context.cpp
+index f4f66bf..91f7dde 100644
+--- a/examples/server/server-context.cpp
++++ b/examples/server/server-context.cpp
+@@ -25,7 +25,11 @@ static bool server_speculative_multimodal_supported(const common_params_speculat
+         return true;
+     }
+     for (const auto & stage : stages) {
+-        if (stage.type != COMMON_SPECULATIVE_TYPE_MTP &&
++        // pi-llm: self-speculative stages draft from the text stream (see server_tokens::get_text_tokens)
++        const bool self_spec = stage.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE ||
++                stage.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K || stage.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
++                stage.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD || stage.type == COMMON_SPECULATIVE_TYPE_SUFFIX;
++        if (stage.type != COMMON_SPECULATIVE_TYPE_MTP && !self_spec &&
+                 !common_speculative_type_is_dflash_family(stage.type)) {
+             return false;
+         }

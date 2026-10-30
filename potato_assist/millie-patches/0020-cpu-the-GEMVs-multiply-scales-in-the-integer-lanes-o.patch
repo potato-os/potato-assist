@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:26:22 +0100
+Subject: [PATCH] cpu: the GEMVs multiply scales in the integer lanes, one
+ rounding as before (#190)
+
+G * sc is exact in int32 (|G| <= 16 * 15 * 127 for Q4_SYM16K and 32 * 127
+for the ternary codes; sub-scales at most 127 and 15) and sc * d8 is exact
+in fp32, so rounding G * sc * d8 once is the GEMV's fma(., G, sc * d8). The
+scale multiply moves into the integer lanes: one operation fewer per
+sub-block in the interleaved 4-bit GEMV and the QT2_R4 kernel, the same bits
+(test-millie-qt2r, the Mac greedy gate). With the previous commit: 12R
+tg128 14.52 -> 15.01.
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 9e328ee..3fa3c05 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -920,9 +920,8 @@ static inline __attribute__((always_inline)) void qt2_r4_group(
+         const int NC, const int nb, const block_qt2_r4 * GGML_RESTRICT x,
+         const block_q8_0 * const * GGML_RESTRICT ys, const qt2_r4_col * GGML_RESTRICT ps, float32x4_t * GGML_RESTRICT out) {
+     const uint8x16_t m3 = vdupq_n_u8(3), mC = vdupq_n_u8(0x0C), m30 = vdupq_n_u8(0x30), m15 = vdupq_n_u8(15);
+-    const float32x4_t z = vdupq_n_f32(0.0f);
+     float32x4_t sum[QT2_R4_NC];
+-    for (int c = 0; c < NC; ++c) sum[c] = z;
++    for (int c = 0; c < NC; ++c) sum[c] = vdupq_n_f32(0.0f);
+     for (int i = 0; i < nb; ++i) {
+         const block_qt2_r4 * GGML_RESTRICT b = x + i;
+         const float32x4_t dv = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b->d)));
+@@ -931,11 +930,11 @@ static inline __attribute__((always_inline)) void qt2_r4_group(
+         const uint16x8_t lo0 = vmovl_u8(vget_low_u8(Slo)), lo1 = vmovl_high_u8(Slo);
+         const uint16x8_t hi0 = vmovl_u8(vget_low_u8(Shi)), hi1 = vmovl_high_u8(Shi);
+         // sub 2j is the low nibble of bytes 4j..4j+3, sub 2j+1 the high one
+-        float32x4_t sc[QKT_MS32K_SUPER];
+-        sc[0] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo0))); sc[1] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi0)));
+-        sc[2] = vcvtq_f32_u32(vmovl_high_u16(lo0));          sc[3] = vcvtq_f32_u32(vmovl_high_u16(hi0));
+-        sc[4] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo1))); sc[5] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi1)));
+-        sc[6] = vcvtq_f32_u32(vmovl_high_u16(lo1));          sc[7] = vcvtq_f32_u32(vmovl_high_u16(hi1));
++        int32x4_t sc[QKT_MS32K_SUPER];
++        sc[0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo0))); sc[1] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi0)));
++        sc[2] = vreinterpretq_s32_u32(vmovl_high_u16(lo0));          sc[3] = vreinterpretq_s32_u32(vmovl_high_u16(hi0));
++        sc[4] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo1))); sc[5] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi1)));
++        sc[6] = vreinterpretq_s32_u32(vmovl_high_u16(lo1));          sc[7] = vreinterpretq_s32_u32(vmovl_high_u16(hi1));
+         float32x4_t a[QT2_R4_NC][4];
+         for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
+             const uint8x16_t Q0 = vld1q_u8(b->qs + 32*sb), Q1 = vld1q_u8(b->qs + 32*sb + 16);
+@@ -958,9 +957,11 @@ static inline __attribute__((always_inline)) void qt2_r4_group(
+                 s2 = vdotq_laneq_s32(s2, v2, Y1, 2);
+                 s0 = vsraq_n_s32(s0, s1, 2);
+                 s0 = vsraq_n_s32(s0, s2, 4);
+-                const float32x4_t g = vcvtq_f32_s32(s0);
+-                const float32x4_t p = vmulq_n_f32(sc[sb], ps[c].d8[i*QKT_MS32K_SUPER + sb]);
+-                a[c][sb & 3] = vfmaq_f32(sb < 4 ? z : a[c][sb & 3], g, p);
++                // G * sc is exact (|G| <= 32 * 127, sc <= 15) and so is sc * d8, so
++                // one rounding of G * sc * d8 is the GEMV's fma(., G, sc * d8)
++                const float32x4_t gs = vcvtq_f32_s32(vmulq_s32(s0, sc[sb]));
++                const float       d8 = ps[c].d8[i*QKT_MS32K_SUPER + sb];
++                a[c][sb & 3] = sb < 4 ? vmulq_n_f32(gs, d8) : vfmaq_n_f32(a[c][sb & 3], gs, d8);
+             }
+         }
+         for (int c = 0; c < NC; ++c) {
+@@ -1077,6 +1078,14 @@ void ggml_gemv_q4_sym16k_x4(int64_t n, int64_t nrows, const void * GGML_RESTRICT
+             const int16x8_t s01 = vmovl_s8(vget_low_s8(S0)), s23 = vmovl_high_s8(S0);
+             const int16x8_t s45 = vmovl_s8(vget_low_s8(S1)), s67 = vmovl_high_s8(S1);
+             const float32x4_t d8 = vld1q_f32(p->d8h);
++            // #190: G * sc is an exact integer (|G| <= 16 * 15 * 127, |sc| <= 127:
++            // under 2^24) and sc * d8/2 an exact float (7 + 11 significant bits),
++            // so rounding G * sc * d8/2 once is the GEMV's fma(0, G, sc * d8/2)
++            // and fma(a, G, sc * d8/2): the scales multiply in the integer lanes.
++            const int32x4_t sc32[QK4_SYM16K_SUPER] = {
++                vmovl_s16(vget_low_s16(s01)), vmovl_high_s16(s01), vmovl_s16(vget_low_s16(s23)), vmovl_high_s16(s23),
++                vmovl_s16(vget_low_s16(s45)), vmovl_high_s16(s45), vmovl_s16(vget_low_s16(s67)), vmovl_high_s16(s67),
++            };
+             float32x4_t gf[QK4_SYM16K_SUPER];
+             for (int j = 0; j < QK4_SYM16K_SUPER; ++j) {
+                 const uint8x16_t v0 = vld1q_u8(b->qs + 32*j), v1 = vld1q_u8(b->qs + 32*j + 16);
+@@ -1085,18 +1094,17 @@ void ggml_gemv_q4_sym16k_x4(int64_t n, int64_t nrows, const void * GGML_RESTRICT
+                 acc = vdotq_laneq_s32(acc, vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)), yv, 2);
+                 acc = vdotq_laneq_s32(acc, vreinterpretq_s8_u8(vandq_u8(v1, m4)), yv, 1);
+                 acc = vdotq_laneq_s32(acc, vreinterpretq_s8_u8(vshrq_n_u8(v1, 4)), yv, 3);
+-                gf[j] = vcvtq_f32_s32(vsubq_s32(vshlq_n_s32(acc, 1), vld1q_dup_s32(&p->ys15[j])));
++                gf[j] = vcvtq_f32_s32(vmulq_s32(vsubq_s32(vshlq_n_s32(acc, 1), vld1q_dup_s32(&p->ys15[j])), sc32[j]));
+             }
+             // The GEMV's accv lane j is sub j then sub 4 + j, summed (0+1)+(2+3).
+-            const float32x4_t z = vdupq_n_f32(0.0f);
+-            float32x4_t a0 = vfmaq_f32(z, gf[0], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s01))), d8, 0));
+-            float32x4_t a1 = vfmaq_f32(z, gf[1], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_high_s16(s01)),         d8, 0));
+-            float32x4_t a2 = vfmaq_f32(z, gf[2], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s23))), d8, 1));
+-            float32x4_t a3 = vfmaq_f32(z, gf[3], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_high_s16(s23)),         d8, 1));
+-            a0 = vfmaq_f32(a0, gf[4], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s45))), d8, 2));
+-            a1 = vfmaq_f32(a1, gf[5], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_high_s16(s45)),         d8, 2));
+-            a2 = vfmaq_f32(a2, gf[6], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s67))), d8, 3));
+-            a3 = vfmaq_f32(a3, gf[7], vmulq_laneq_f32(vcvtq_f32_s32(vmovl_high_s16(s67)),         d8, 3));
++            float32x4_t a0 = vmulq_laneq_f32(gf[0], d8, 0);
++            float32x4_t a1 = vmulq_laneq_f32(gf[1], d8, 0);
++            float32x4_t a2 = vmulq_laneq_f32(gf[2], d8, 1);
++            float32x4_t a3 = vmulq_laneq_f32(gf[3], d8, 1);
++            a0 = vfmaq_laneq_f32(a0, gf[4], d8, 2);
++            a1 = vfmaq_laneq_f32(a1, gf[5], d8, 2);
++            a2 = vfmaq_laneq_f32(a2, gf[6], d8, 3);
++            a3 = vfmaq_laneq_f32(a3, gf[7], d8, 3);
+             sum = vfmaq_f32(sum, dv, vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+         }
+         vst1q_f32(dst + 4*g, sum);

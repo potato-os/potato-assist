@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Potato Assist</title>
+<style>
+  :root {
+    --bg: #f5f7fb;
+    --bg-grad-a: rgba(43, 136, 255, 0.18);
+    --bg-grad-b: rgba(18, 206, 193, 0.15);
+    --panel: #ffffff;
+    --panel-muted: #f1f4f9;
+    --text: #142033;
+    --text-muted: #5f6f86;
+    --border: #d7dfeb;
+    --user-bg: linear-gradient(135deg, #1e67de, #2a82f1);
+    --user-text: #ffffff;
+    --assistant-bg: #ffffff;
+    --composer-bg: #ffffff;
+    --status-bg: #edf4ff;
+    --status-text: #215b9a;
+    --shadow: 0 18px 45px rgba(19, 37, 74, 0.11);
+    --shadow-soft: 0 8px 26px rgba(19, 37, 74, 0.08);
+    --focus: #2f7cf6;
+    --ok: #10a37f;
+    --metric-normal: #142033;
+    --metric-warn: #b57d00;
+    --metric-high: #d95e00;
+    --metric-critical: #c81e1e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #081425;
+      --bg-grad-a: rgba(41, 147, 251, 0.2);
+      --bg-grad-b: rgba(16, 185, 129, 0.16);
+      --panel: #0e1f35;
+      --panel-muted: #10243c;
+      --text: #e7eefb;
+      --text-muted: #a6b6d0;
+      --border: #233a59;
+      --user-bg: linear-gradient(135deg, #2f7cf6, #17a5f2);
+      --user-text: #f6fbff;
+      --assistant-bg: #112944;
+      --composer-bg: #0f223a;
+      --status-bg: #132e4b;
+      --status-text: #d1e6ff;
+      --shadow: 0 20px 48px rgba(0, 0, 0, 0.38);
+      --shadow-soft: 0 10px 28px rgba(0, 0, 0, 0.24);
+      --focus: #69adff;
+      --metric-normal: #f8fbff;
+      --metric-warn: #ffd86b;
+      --metric-high: #ffb067;
+      --metric-critical: #ff7f7f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; color: var(--text);
+    font-family: "Manrope", "Avenir Next", "SF Pro Display", "Segoe UI", sans-serif;
+    background: radial-gradient(circle at 10% 0%, var(--bg-grad-a), transparent 40%),
+                radial-gradient(circle at 90% 10%, var(--bg-grad-b), transparent 40%), var(--bg);
+  }
+  .layout { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px;
+    grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  aside { display: flex; flex-direction: column; gap: 12px; }
+  .card { background: color-mix(in srgb, var(--panel) 96%, transparent); border: 1px solid var(--border);
+    border-radius: 18px; padding: 14px; box-shadow: var(--shadow-soft); }
+  .card-title { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 14px; margin-bottom: 8px; }
+  .muted { color: var(--text-muted); }
+  .small { font-size: 12px; }
+  select, input[type=number] { border: 1px solid var(--border); border-radius: 10px; padding: 7px 9px; background: var(--panel);
+    color: var(--text); font: inherit; font-size: 14px; width: 100%; }
+  .field { display: grid; gap: 4px; margin-top: 10px; font-size: 13px; }
+  .field-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .field-row input[type=number], .field-row select { width: 120px; }
+  .field .help { font-size: 11.5px; color: var(--text-muted); }
+  .default-mark { font-size: 11px; color: var(--text-muted); }
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .ghost-btn { border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 12px;
+    padding: 7px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  .ghost-btn:hover { border-color: var(--focus); }
+  .primary-btn { border: none; border-radius: 12px; padding: 8px 14px; font: inherit; font-weight: 600; font-size: 13px;
+    cursor: pointer; color: #fff; background: linear-gradient(135deg, #1e67de, #2a82f1); }
+  .primary-btn:disabled, .send-btn:disabled { opacity: 0.5; cursor: default; }
+  .status { display: inline-flex; align-items: center; gap: 8px; padding: 5px 11px; border-radius: 999px;
+    background: var(--status-bg); color: var(--status-text); font-size: 12.5px; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .dot.ready { background: var(--ok); }
+  .dot.error { background: var(--metric-critical); }
+  .dot.loading, .dot.downloading { background: var(--metric-warn); animation: pulse 1s ease-in-out infinite alternate; }
+  @keyframes pulse { to { opacity: 0.3; } }
+  .progress { height: 6px; border-radius: 999px; background: var(--panel-muted); overflow: hidden; margin-top: 8px; }
+  .progress > div { height: 100%; background: linear-gradient(90deg, #1e67de, #12cec1); width: 0; transition: width 0.4s; }
+  .status-msg { font-size: 12px; color: var(--text-muted); margin-top: 6px; overflow-wrap: anywhere; }
+  .status-msg.error { color: var(--metric-critical); }
+  /* Pi runtime card */
+  .runtime-compact { font-size: 12px; line-height: 1.6; color: var(--text-muted); overflow-wrap: anywhere; }
+  .runtime-compact b { color: var(--text); font-weight: 600; }
+  .runtime-details { margin-top: 10px; display: grid; gap: 10px; }
+  .group { border: 1px solid color-mix(in srgb, var(--border) 80%, transparent); border-radius: 12px; padding: 8px 10px; }
+  .group-title { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 4px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; padding: 2px 0; }
+  .row span:last-child { font-variant-numeric: tabular-nums; text-align: right; }
+  .m-normal { color: var(--metric-normal); } .m-warn { color: var(--metric-warn); }
+  .m-high { color: var(--metric-high); } .m-critical { color: var(--metric-critical); font-weight: 700; }
+  .spark { width: 100%; height: 44px; margin-top: 6px; display: block; }
+  .bars { display: flex; gap: 3px; align-items: flex-end; height: 22px; }
+  .bars > div { width: 10px; background: var(--focus); border-radius: 2px; opacity: 0.8; }
+  /* chat */
+  main { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .messages { background: color-mix(in srgb, var(--panel) 96%, transparent); border: 1px solid var(--border); border-radius: 20px;
+    padding: 16px 14px; overflow: auto; display: flex; flex-direction: column; gap: 12px; min-height: 360px;
+    max-height: min(66vh, 720px); box-shadow: var(--shadow-soft); }
+  .empty { color: var(--text-muted); font-size: 14px; margin: auto; text-align: center; }
+  .msg { display: flex; } .msg.user { justify-content: flex-end; }
+  .stack { max-width: min(82ch, 86%); display: flex; flex-direction: column; gap: 4px; }
+  .bubble { border: 1px solid color-mix(in srgb, var(--border) 82%, transparent); border-radius: 18px; padding: 12px 15px;
+    white-space: pre-wrap; line-height: 1.5; font-size: 15px; overflow-wrap: anywhere; box-shadow: 0 3px 14px rgba(16, 23, 42, 0.06); }
+  .msg.user .bubble { background: var(--user-bg); color: var(--user-text); border-color: transparent; }
+  .msg.assistant .bubble { background: var(--assistant-bg); }
+  .bubble.error { border-color: var(--metric-critical); color: var(--metric-critical); }
+  .meta { font-size: 12px; color: var(--text-muted); padding: 0 6px; }
+  .composer { background: var(--composer-bg); border: 1px solid var(--border); border-radius: 20px; padding: 12px; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 10px; }
+  textarea { width: 100%; resize: vertical; border: none; outline: none; background: transparent; color: var(--text); font: inherit;
+    font-size: 15px; line-height: 1.5; }
+  .composer-bottom { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .options { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-muted); flex-wrap: wrap; }
+  .options label { display: inline-flex; align-items: center; gap: 6px; }
+  .options input[type=number] { width: 72px; padding: 3px 6px; font-size: 13px; }
+  .right { display: flex; align-items: center; gap: 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--status-text); background: var(--status-bg);
+    border-radius: 999px; padding: 6px 10px; }
+  .spinner { width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+    animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .send-btn { border: none; border-radius: 14px; padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer; color: #fff;
+    background: linear-gradient(135deg, #1e67de, #2a82f1); }
+  .bubble img { display: block; max-width: min(320px, 100%); max-height: 260px; border-radius: 12px; margin-bottom: 8px; }
+  .attach { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-muted); }
+  .attach img { height: 56px; border-radius: 10px; border: 1px solid var(--border); }
+  details.sys { font-size: 13px; color: var(--text-muted); }
+  details.sys textarea { margin-top: 6px; border: 1px solid var(--border); border-radius: 10px; padding: 8px; }
+  a { color: var(--focus); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <section class="card">
+      <div class="card-title"><span>Model</span><span class="status"><span id="dot" class="dot"></span><span id="stateText">…</span></span></div>
+      <select id="modelSelect"></select>
+      <div id="modelNote" class="small muted" style="margin-top:6px"></div>
+      <div id="progressWrap" class="progress" hidden><div id="progressBar"></div></div>
+      <div id="statusMsg" class="status-msg"></div>
+      <div id="params"></div>
+      <div class="btn-row">
+        <button id="applyBtn" class="primary-btn" type="button">Load</button>
+        <button id="defaultsBtn" class="ghost-btn" type="button">Best defaults</button>
+        <button id="stopBtn" class="ghost-btn" type="button">Unload</button>
+      </div>
+      <div class="small muted" style="margin-top:8px"><span id="engineLabel"></span> · <a href="api/logs" target="_blank">engine log</a></div>
+    </section>
+
+    <section class="card">
+      <div class="card-title"><span>Pi Runtime</span><button id="detailsToggle" class="ghost-btn" type="button">Show details</button></div>
+      <div id="compact" class="runtime-compact">Reading…</div>
+      <svg id="spark" class="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-label="CPU temperature, last 3 minutes"></svg>
+      <div id="details" class="runtime-details" hidden>
+        <div class="group"><div class="group-title">Performance</div>
+          <div class="row"><span>CPU total</span><span id="d-cpu">--</span></div>
+          <div class="row"><span>Cores</span><span id="d-cores">--</span></div>
+          <div class="row"><span>Clock (kernel / measured)</span><span id="d-clock">--</span></div>
+          <div class="row"><span>Load average</span><span id="d-load">--</span></div>
+        </div>
+        <div class="group"><div class="group-title">Thermal</div>
+          <div class="row"><span>CPU</span><span id="d-temp">--</span></div>
+          <div class="row"><span>Peak this session</span><span id="d-tmax">--</span></div>
+          <div class="row"><span>Throttling now</span><span id="d-thr">--</span></div>
+          <div class="row"><span>Since boot</span><span id="d-thrb">--</span></div>
+          <div class="row"><span>Fan</span><span id="d-fan">--</span></div>
+          <div class="row"><span>NVMe / RP1</span><span id="d-nvme">--</span></div>
+        </div>
+        <div class="group"><div class="group-title">Power</div>
+          <div class="row"><span>PMIC rails (estimate)</span><span id="d-pwr">--</span></div>
+          <div class="row"><span>5 V input</span><span id="d-5v">--</span></div>
+          <div class="row"><span>Core voltage</span><span id="d-vcore">--</span></div>
+        </div>
+        <div class="group"><div class="group-title">Memory</div>
+          <div class="row"><span>Potato Assist (used)</span><span id="d-app">--</span></div>
+          <div class="row"><span>· model + KV (anon) / file cache</span><span id="d-appsplit">--</span></div>
+          <div class="row"><span>· controller</span><span id="d-ctl">--</span></div>
+          <div class="row"><span>Pi available</span><span id="d-mem">--</span></div>
+          <div class="row"><span>Engine RSS (anon / file)</span><span id="d-rss">--</span></div>
+          <div class="row"><span>Engine peak</span><span id="d-peak">--</span></div>
+          <div class="row"><span>Pressure (some, 10 s)</span><span id="d-psi">--</span></div>
+          <div class="row"><span>Swap used</span><span id="d-swap">--</span></div>
+        </div>
+        <div class="group"><div class="group-title">Storage &amp; platform</div>
+          <div class="row"><span>/share free</span><span id="d-disk">--</span></div>
+          <div class="row"><span>Board</span><span id="d-board">--</span></div>
+          <div class="row"><span>Kernel</span><span id="d-kernel">--</span></div>
+          <div class="row"><span>Firmware</span><span id="d-fw">--</span></div>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <main>
+    <section id="messages" class="messages"><div class="empty" id="empty">Load a model, then send a message.</div></section>
+    <form id="composer" class="composer">
+      <textarea id="prompt" rows="3" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div id="attachPreview" class="attach" hidden><img id="attachImg" alt="Attached image"><span id="attachMeta"></span>
+        <button id="attachClear" class="ghost-btn" type="button">Remove</button></div>
+      <details class="sys"><summary>System prompt</summary><textarea id="system" rows="3" placeholder="Optional system prompt"></textarea></details>
+      <div class="composer-bottom">
+        <div class="options">
+          <input id="imageInput" type="file" accept="image/*" hidden>
+          <button id="attachBtn" class="ghost-btn" type="button" title="Attach an image (or paste one)">Attach image</button>
+          <label><input id="thinking" type="checkbox"> Thinking</label>
+          <label>Temp <input id="temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+          <label>Max tokens <input id="maxTokens" type="number" min="16" max="8192" step="16" value="512"></label>
+        </div>
+        <div class="right">
+          <span id="chip" class="chip" hidden><span class="spinner"></span><span id="chipText">Reading prompt…</span></span>
+          <button id="stop" class="ghost-btn" type="button" hidden>Stop</button>
+          <button id="newChat" class="ghost-btn" type="button">New chat</button>
+          <button id="send" class="send-btn" type="submit">Send</button>
+        </div>
+      </div>
+    </form>
+  </main>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let status = null;
+  let edited = {};  // model id -> params being edited
+  const history = [];
+  let controller = null;
+  let waitText = null;  // chip text while a chat waits for its first token
+
+  // ---------------------------------------------------------------- model + params
+  async function refreshStatus() {
+    try {
+      status = await (await fetch('api/status', { cache: 'no-store' })).json();
+    } catch { $('stateText').textContent = 'Offline'; $('dot').className = 'dot error'; return; }
+    const e = status.engine;
+    const sel = $('modelSelect');
+    if (!sel.options.length) {
+      for (const [id, m] of Object.entries(status.models)) sel.add(new Option(m.label, id));
+      sel.value = e.model || Object.keys(status.models)[0];
+      renderParams();
+    }
+    $('dot').className = `dot ${e.state}`;
+    const label = e.model ? status.models[e.model].label : '';
+    $('stateText').textContent = { ready: 'Ready', loading: 'Loading', downloading: 'Downloading', stopped: 'Unloaded', error: 'Error' }[e.state] || e.state;
+    let msg = e.state === 'ready' ? `${label} loaded${e.load_seconds ? ` in ${e.load_seconds}s` : ''}` : (e.message || (e.state === 'loading' ? `Loading ${label}…` : ''));
+    // The engine serves one request at a time: say what it is busy with, since a chat sent now waits for it.
+    const busy = e.state === 'ready' ? e.busy?.[0] : null;
+    if (busy) msg += ` · ${busy.what} (${busy.seconds}s); chats wait until it finishes`;
+    if (waitText) $('chipText').textContent = busy ? `Waiting: ${busy.what.toLowerCase()} (${busy.seconds}s)…` : waitText;
+    if (e.download) {
+      const pct = e.download.total ? (100 * e.download.done / e.download.total) : 0;
+      $('progressWrap').hidden = false;
+      $('progressBar').style.width = `${pct.toFixed(1)}%`;
+      msg = `Downloading ${e.download.file}: ${(e.download.done / 2 ** 30).toFixed(2)} / ${(e.download.total / 2 ** 30).toFixed(2)} GiB`;
+    } else { $('progressWrap').hidden = true; }
+    $('statusMsg').textContent = msg;
+    $('statusMsg').className = `status-msg ${e.state === 'error' ? 'error' : ''}`;
+    $('engineLabel').textContent = e.engine ? status.engines[e.engine] : 'no engine running';
+    $('send').disabled = e.state !== 'ready' || !!controller;
+  }
+
+  function currentParams(id) {
+    return edited[id] || structuredClone(status.models[id].params);
+  }
+
+  function renderParams() {
+    const id = $('modelSelect').value;
+    const m = status.models[id];
+    const params = currentParams(id);
+    $('modelNote').textContent = `${m.note} ${m.downloaded ? '' : `(downloads ${(m.bytes / 2 ** 30).toFixed(1)} GiB on first load)`}`;
+    const box = $('params');
+    box.replaceChildren();
+    for (const [key, value] of Object.entries(params)) {
+      const spec = status.param_specs[key];
+      const def = m.defaults[key];
+      const field = document.createElement('label');
+      field.className = 'field';
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const name = document.createElement('span');
+      name.innerHTML = `${spec.label} <span class="default-mark">${value === def ? '' : `(best: ${def})`}</span>`;
+      let input;
+      if (spec.type === 'choice') {
+        input = document.createElement('select');
+        for (const c of spec.choices) input.add(new Option(c, c));
+        input.value = value;
+      } else if (spec.type === 'bool') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!value;
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        Object.assign(input, { min: spec.min, max: spec.max, step: spec.step || 1, value });
+      }
+      input.addEventListener('change', () => {
+        const p = currentParams(id);
+        p[key] = spec.type === 'bool' ? input.checked : spec.type === 'int' ? Number(input.value) : input.value;
+        edited[id] = p;
+        renderParams();
+      });
+      row.append(name, input);
+      field.append(row);
+      if (spec.help) {
+        const help = document.createElement('span');
+        help.className = 'help';
+        help.textContent = spec.help;
+        field.append(help);
+      }
+      box.append(field);
+    }
+  }
+
+  $('modelSelect').addEventListener('change', renderParams);
+  $('defaultsBtn').addEventListener('click', () => {
+    const id = $('modelSelect').value;
+    edited[id] = structuredClone(status.models[id].defaults);
+    renderParams();
+  });
+  $('applyBtn').addEventListener('click', async () => {
+    const id = $('modelSelect').value;
+    $('applyBtn').disabled = true;
+    try {
+      const r = await fetch('api/load', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: id, params: currentParams(id) }) });
+      if (!r.ok) throw new Error(await r.text());
+      delete edited[id];
+      status = null;
+      $('modelSelect').replaceChildren();
+    } catch (err) { $('statusMsg').textContent = String(err.message || err); }
+    finally { $('applyBtn').disabled = false; refreshStatus(); }
+  });
+  $('stopBtn').addEventListener('click', async () => { await fetch('api/stop', { method: 'POST' }); refreshStatus(); });
+
+  // ---------------------------------------------------------------- telemetry
+  const level = (t) => t >= 85 ? 'm-critical' : t >= 80 ? 'm-high' : t >= 70 ? 'm-warn' : 'm-normal';
+  const gib = (mib) => mib == null ? '--' : `${(mib / 1024).toFixed(2)} GiB`;
+
+  async function refreshTelemetry() {
+    let t;
+    try { t = await (await fetch('api/telemetry', { cache: 'no-store' })).json(); } catch { return; }
+    const s = t.latest;
+    if (!s || !s.time) return;
+    const fw = s.firmware || {};
+    const temp = s.cpu_temp_c ?? 0;
+    const thrNow = fw.throttled_now ? (fw.throttled_now.length ? fw.throttled_now.join(', ') : 'none') : (temp >= 80 ? 'likely (≥80 °C)' : 'n/a');
+    const measured = fw.arm_mhz_measured ? `${fw.arm_mhz_measured} MHz` : `${Math.max(...s.cores_mhz)} MHz`;
+    $('compact').innerHTML =
+      `CPU <b class="${level(temp)}">${temp.toFixed(1)} °C</b> · <b>${s.cpu_pct}%</b> · ${measured}` +
+      ` · Fan <b>${s.fan_rpm ?? '--'}</b> rpm · App RAM <b>${gib(s.app_used_mib)}</b> · Free <b>${gib(s.mem_available_mib)}</b>` +
+      ` · Throttle <b class="${fw.throttled_now?.length ? 'm-critical' : ''}">${thrNow}</b>` +
+      (fw.pmic_rails_watts ? ` · <b>${fw.pmic_rails_watts} W</b>` : '');
+    $('d-cpu').textContent = `${s.cpu_pct}%`;
+    $('d-cores').innerHTML = `<span class="bars">${s.cores_pct.map((p) => `<div title="${p}%" style="height:${Math.max(2, p * 0.22)}px"></div>`).join('')}</span>`;
+    $('d-clock').textContent = `${s.cores_mhz.join('/')} / ${fw.arm_mhz_measured ?? '--'} MHz`;
+    $('d-load').textContent = s.load.map((x) => x.toFixed(2)).join(' ');
+    $('d-temp').innerHTML = `<span class="${level(temp)}">${temp.toFixed(1)} °C</span>`;
+    $('d-tmax').innerHTML = `<span class="${level(s.max_temp_c)}">${s.max_temp_c.toFixed(1)} °C</span>`;
+    $('d-thr').innerHTML = `<span class="${fw.throttled_now?.length ? 'm-critical' : ''}">${thrNow}</span>`;
+    $('d-thrb').textContent = fw.throttled_since_boot ? (fw.throttled_since_boot.join(', ') || 'none') + ` (${fw.throttled_raw})` : 'n/a';
+    $('d-fan').textContent = `${s.fan_rpm ?? '--'} rpm · ${s.fan_pwm_pct ?? '--'}%`;
+    $('d-nvme').textContent = `${s.nvme_temp_c?.toFixed(1) ?? '--'} / ${s.rp1_temp_c?.toFixed(1) ?? '--'} °C`;
+    $('d-pwr').textContent = fw.pmic_rails_watts ? `${fw.pmic_rails_watts} W` : 'n/a';
+    $('d-5v').textContent = fw.ext5v_volts ? `${fw.ext5v_volts.toFixed(2)} V${s.undervoltage_alarm ? ' · UNDERVOLTAGE' : ''}` : (s.undervoltage_alarm ? 'UNDERVOLTAGE' : 'n/a');
+    $('d-vcore').textContent = fw.core_volts ? `${fw.core_volts.toFixed(4)} V` : 'n/a';
+    $('d-mem').textContent = `${gib(s.mem_available_mib)} of ${gib(s.mem_total_mib)}`;
+    $('d-app').textContent = s.app_used_mib != null ? `${gib(s.app_used_mib)} (${Math.round(100 * s.app_used_mib / s.mem_total_mib)}% of RAM)` : 'n/a';
+    $('d-appsplit').textContent = s.app_anon_mib != null ? `${gib(s.app_anon_mib)} / ${gib(s.app_file_mib)}` : 'n/a';
+    $('d-ctl').textContent = s.controller_rss_mib != null ? `${s.controller_rss_mib} MiB` : 'n/a';
+    $('d-rss').textContent = s.engine_rss_mib != null ? `${gib(s.engine_rss_mib)} (${gib(s.engine_anon_mib)} / ${gib(s.engine_file_mib)})` : '--';
+    $('d-peak').textContent = gib(s.engine_peak_mib);
+    $('d-psi').textContent = s.mem_pressure_some10 != null ? `${s.mem_pressure_some10}%` : 'n/a';
+    $('d-swap').textContent = `${s.swap_used_mib} MiB`;
+    $('d-disk').textContent = `${s.share_free_gib} GiB`;
+    const p = status?.platform || {};
+    $('d-board').textContent = p.model || '--';
+    $('d-kernel').textContent = p.kernel || '--';
+    $('d-fw').textContent = p.firmware || 'n/a';
+    drawSpark(t.history);
+  }
+
+  function drawSpark(hist) {
+    const pts = hist.filter((h) => h.cpu_temp_c != null);
+    if (pts.length < 2) return;
+    const lo = 40, hi = 90;
+    const x = (i) => (i / (pts.length - 1)) * 300;
+    const y = (v) => 44 - ((Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo)) * 42 - 1;
+    const line = pts.map((h, i) => `${x(i).toFixed(1)},${y(h.cpu_temp_c).toFixed(1)}`).join(' ');
+    $('spark').innerHTML =
+      `<line x1="0" x2="300" y1="${y(80)}" y2="${y(80)}" stroke="var(--metric-high)" stroke-dasharray="4 4" stroke-width="1" opacity="0.6"/>` +
+      `<polyline points="${line}" fill="none" stroke="var(--focus)" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+  }
+
+  $('detailsToggle').addEventListener('click', () => {
+    const d = $('details');
+    d.hidden = !d.hidden;
+    $('detailsToggle').textContent = d.hidden ? 'Show details' : 'Hide details';
+  });
+
+  // ---------------------------------------------------------------- chat
+  function addMessage(role, text, image) {
+    $('empty').hidden = true;
+    const row = document.createElement('div');
+    row.className = `msg ${role}`;
+    const stack = document.createElement('div');
+    stack.className = 'stack';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (image) {
+      const img = document.createElement('img');
+      img.src = image;
+      img.alt = 'Attached image';
+      bubble.append(img, document.createTextNode(text));
+    } else {
+      bubble.textContent = text;
+    }
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    stack.append(bubble, meta);
+    row.append(stack);
+    $('messages').append(row);
+    $('messages').scrollTop = $('messages').scrollHeight;
+    return { bubble, meta };
+  }
+
+  function formatStats(timings, finish, ttftMs, tokens, totalMs) {
+    const tps = timings?.predicted_per_second ?? (tokens / Math.max(totalMs - ttftMs, 1) * 1000);
+    const pp = timings?.prompt_per_second ? ` · prompt ${timings.prompt_n} tok @ ${timings.prompt_per_second.toFixed(1)} tok/s` : '';
+    const n = timings?.predicted_n ?? tokens;
+    return `TTFT ${(ttftMs / 1000).toFixed(2)}s · ${tps.toFixed(2)} tok/s · ${n} tokens · ${(totalMs / 1000).toFixed(2)}s${pp} · ${finish ?? 'stopped'}`;
+  }
+
+  // ---------------------------------------------------------------- images
+  // Phone photos are shrunk in the browser (longest side 1024 px, JPEG) before they are sent; the engine caps
+  // the image at its own token budget anyway, so more pixels only cost upload time.
+  let attached = null;  // data URL
+  async function attachFile(file) {
+    if (!file || !file.type.startsWith('image/')) return;
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, 1024 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    attached = canvas.toDataURL('image/jpeg', 0.85);
+    $('attachImg').src = attached;
+    $('attachMeta').textContent = `${canvas.width}×${canvas.height}, ${Math.round(attached.length * 0.75 / 1024)} KB`;
+    $('attachPreview').hidden = false;
+  }
+  function clearAttachment() {
+    attached = null;
+    $('attachPreview').hidden = true;
+    $('imageInput').value = '';
+  }
+  function visionReady() {
+    const e = status?.engine;
+    return e?.state === 'ready' && !!e.params?.vision;
+  }
+  $('attachBtn').addEventListener('click', () => {
+    if (!visionReady()) { $('statusMsg').textContent = 'Vision is off for this model: enable it in the model settings and reload.'; return; }
+    $('imageInput').click();
+  });
+  $('imageInput').addEventListener('change', () => attachFile($('imageInput').files[0]));
+  $('attachClear').addEventListener('click', clearAttachment);
+  $('prompt').addEventListener('paste', (e) => {
+    const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
+    if (item && visionReady()) { e.preventDefault(); attachFile(item.getAsFile()); }
+  });
+
+  async function send(text) {
+    const system = $('system').value.trim();
+    const image = attached;
+    clearAttachment();
+    history.push({ role: 'user', content: image
+      ? [{ type: 'text', text }, { type: 'image_url', image_url: { url: image } }]
+      : text });
+    addMessage('user', text, image);
+    const { bubble, meta } = addMessage('assistant', '');
+    $('send').disabled = true;
+    $('stop').hidden = false;
+    $('chip').hidden = false;
+    waitText = image ? 'Encoding image…' : 'Reading prompt…';
+    $('chipText').textContent = waitText;
+    controller = new AbortController();
+    refreshStatus();
+    const started = performance.now();
+    let ttft = null, tokens = 0, reply = '', timings = null, finish = null;
+    try {
+      const res = await fetch('v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({
+          messages: system ? [{ role: 'system', content: system }, ...history] : history,
+          stream: true, temperature: Number($('temp').value), top_p: 0.8, top_k: 20,
+          max_tokens: Number($('maxTokens').value),
+          chat_template_kwargs: { enable_thinking: $('thinking').checked },
+        }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          const event = JSON.parse(data);
+          const choice = event.choices?.[0];
+          const delta = choice?.delta?.content ?? choice?.delta?.reasoning_content ?? '';
+          if (delta) {
+            if (ttft === null) { ttft = performance.now() - started; waitText = null; $('chipText').textContent = 'Generating…'; }
+            tokens += 1;
+            reply += delta;
+            bubble.textContent = reply.replace(/^\s*<think>\s*<\/think>\s*/, '');
+            $('messages').scrollTop = $('messages').scrollHeight;
+          }
+          if (choice?.finish_reason) finish = choice.finish_reason;
+          if (event.timings) timings = event.timings;
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') { bubble.classList.add('error'); bubble.textContent = reply || String(err.message || err); }
+    } finally {
+      const total = performance.now() - started;
+      meta.textContent = formatStats(timings, finish, ttft ?? total, tokens, total);
+      reply = reply.replace(/^\s*<think>\s*<\/think>\s*/, '');
+      if (reply) history.push({ role: 'assistant', content: reply });
+      $('stop').hidden = true;
+      $('chip').hidden = true;
+      waitText = null;
+      controller = null;
+      refreshStatus();
+    }
+  }
+
+  $('composer').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = $('prompt').value.trim() || (attached ? 'Describe this image.' : '');
+    if (!text || controller || status?.engine.state !== 'ready') return;
+    $('prompt').value = '';
+    send(text);
+  });
+  $('prompt').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('composer').requestSubmit(); }
+  });
+  $('stop').addEventListener('click', () => controller?.abort());
+  $('newChat').addEventListener('click', () => {
+    controller?.abort();
+    history.length = 0;
+    $('messages').replaceChildren($('empty'));
+    $('empty').hidden = false;
+  });
+
+  refreshStatus().then(refreshTelemetry);
+  setInterval(refreshStatus, 2000);
+  setInterval(refreshTelemetry, 2000);
+</script>
+</body>
+</html>

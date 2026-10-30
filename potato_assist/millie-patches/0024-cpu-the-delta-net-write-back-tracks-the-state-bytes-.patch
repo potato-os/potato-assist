@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:23:47 +0100
+Subject: [PATCH] cpu: the delta-net write-back tracks the state bytes still
+ unwritten (#190 review)
+
+The scan for later readers of the state range stopped at the first node
+whose output overlapped any of it, so a read of the part that node left
+alone went unseen. It now keeps the unwritten bytes as up to eight ranges,
+removes only what a contiguous output covers, and fails the plan when a
+read touches what is left or the ranges no longer fit.
+
+Millie on the Mac CPU tree: all 30 delta-net copies are still folded in
+every graph, greedy text identical.
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 6241db0..72631b6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3203,6 +3203,36 @@ static bool ggml_cpu_node_reads(const struct ggml_tensor * t, const void * p, si
+     return false;
+ }
+ 
++// The bytes of a range not yet overwritten, as up to eight ranges.
++struct ggml_cpu_live {
++    const char * lo[8];
++    const char * hi[8];
++    int          n;
++};
++
++// Removes [a, b) from the live ranges; false when they no longer fit.
++static bool ggml_cpu_live_cut(struct ggml_cpu_live * l, const char * a, const char * b) {
++    struct ggml_cpu_live out = { { 0 }, { 0 }, 0 };
++    for (int r = 0; r < l->n; ++r) {
++        const char * lo = l->lo[r], * hi = l->hi[r];
++        if (b <= lo || hi <= a) {
++            if (out.n == 8) return false;
++            out.lo[out.n] = lo; out.hi[out.n++] = hi;
++            continue;
++        }
++        if (lo < a) {
++            if (out.n == 8) return false;
++            out.lo[out.n] = lo; out.hi[out.n++] = a;
++        }
++        if (b < hi) {
++            if (out.n == 8) return false;
++            out.lo[out.n] = b; out.hi[out.n++] = hi;
++        }
++    }
++    *l = out;
++    return true;
++}
++
+ static bool ggml_cpu_state_writeback_on(void) {
+     static int on = -1;
+     if (on < 0) {
+@@ -3258,13 +3288,19 @@ static void ggml_cpu_plan_state_writeback(struct ggml_threadpool * tp, const str
+         for (int k = i + 1; ok && k < j; ++k) {
+             ok = !ggml_cpu_node_touches(g->nodes[k], cache, bytes) && !ggml_cpu_node_touches(g->nodes[k], state, bytes);
+         }
+-        // nothing else reads the state range until it is written again
+-        for (int k = j + 1; ok && k < n; ++k) {
++        // nothing else reads any byte of the state range before that byte is
++        // written again (a later tensor may reuse only part of it)
++        struct ggml_cpu_live live = { { state }, { state + bytes }, 1 };
++        for (int k = j + 1; ok && live.n > 0 && k < n; ++k) {
+             const struct ggml_tensor * t = g->nodes[k];
+-            if (ggml_cpu_node_reads(t, state, bytes)) {
+-                ok = false;
+-            } else if (!ggml_op_is_empty(t->op) && t->data && ggml_cpu_overlaps(t->data, ggml_nbytes(t), state, bytes)) {
+-                break;
++            if (ggml_op_is_empty(t->op)) {
++                continue;
++            }
++            for (int r = 0; ok && r < live.n; ++r) {
++                ok = !ggml_cpu_node_reads(t, live.lo[r], live.hi[r] - live.lo[r]);
++            }
++            if (ok && t->data && ggml_is_contiguous(t)) {
++                ok = ggml_cpu_live_cut(&live, (const char *) t->data, (const char *) t->data + ggml_nbytes(t));
+             }
+         }
+         if (ok) {

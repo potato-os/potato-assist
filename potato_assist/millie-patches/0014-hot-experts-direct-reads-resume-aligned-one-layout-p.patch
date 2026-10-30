@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 23:10:33 +0100
+Subject: [PATCH] hot experts: direct reads resume aligned, one layout per
+ layer's experts (#185)
+
+A short O_DIRECT read resumed at an unaligned buffer, offset and length,
+which the kernel rejects: the retry now resumes on a block boundary, the
+loops stop once the range itself is in (the aligned span's tail may run past
+the end of the file), and a retry that makes no progress aborts instead of
+spinning. The admission path takes the repack decision from the first expert
+tensor for all three; it now asserts the three agree.
+
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 82143cf..82c5532 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -176,19 +176,26 @@ static void hot_pread_exact(int fd, unsigned char * dst, size_t bytes, size_t of
+         }
+         cap = hi - lo;
+     }
+-    size_t done = 0;
+-    while (done < hi - lo) {
++    // Done once the expert itself is in: the aligned span's tail may run past
++    // the end of the file. A short read resumes on a block boundary (#185).
++    const size_t need = (offset - lo) + bytes;
++    size_t       done = 0;
++    while (done < need) {
+         ssize_t n = pread(fd, static_cast<unsigned char *>(buf) + done, hi - lo - done, lo + done);
+         if (n < 0 && errno == EINTR) {
+             continue;
+         }
+-        if (n == 0 && done >= (offset - lo) + bytes) {
+-            break; // the aligned span ran past the end of the file; the expert itself is complete
+-        }
+         if (n <= 0) {
+             GGML_ABORT("hot-cache direct expert read failed: %s", strerror(errno));
+         }
++        const size_t prev = done;
+         done += n;
++        if (done < need) {
++            done &= ~(align - 1);
++            if (done <= prev) {
++                GGML_ABORT("hot-cache direct read made no progress");
++            }
++        }
+     }
+     memcpy(dst, static_cast<unsigned char *>(buf) + (offset - lo), bytes);
+ }
+@@ -277,19 +284,28 @@ static const unsigned char * hot_pread_into(int fd, size_t offset, size_t bytes,
+     const size_t lo     = direct ? offset & ~size_t(4095) : offset;
+     const size_t hi     = direct ? (offset + bytes + 4095) & ~size_t(4095) : offset + bytes;
+ #    endif
+-    size_t done = 0;
+-    while (done < hi - lo) {
++    // Done once the range itself is in: the aligned span's tail may run past
++    // the end of the file. A short direct read resumes on a block boundary.
++    const size_t need = (offset - lo) + bytes;
++    size_t       done = 0;
++    while (done < need) {
+         ssize_t n = pread(fd, buf + done, hi - lo - done, lo + done);
+         if (n < 0 && errno == EINTR) {
+             continue;
+         }
+-        if (n == 0 && done >= (offset - lo) + bytes) {
+-            break; // the aligned span ran past the end of the file
+-        }
+         if (n <= 0) {
+             GGML_ABORT("hot-cache expert read failed: %s", strerror(errno));
+         }
++        const size_t prev = done;
+         done += n;
++#    if !defined(__APPLE__)
++        if (direct && done < need) {
++            done &= ~size_t(4095);
++            if (done <= prev) {
++                GGML_ABORT("hot-cache direct read made no progress");
++            }
++        }
++#    endif
+     }
+ #    if !defined(__APPLE__)
+     if (!direct) {
+@@ -593,6 +609,8 @@ struct llama_hot_cache {
+         }
+ 
+         GGML_ASSERT(s.weights.size() == 3 && loads.size() <= 8);
++        // One layout for the layer's three expert tensors (all QT_MS32K4 in Millie).
++        GGML_ASSERT(s.weights[1]->repack == s.weights[0]->repack && s.weights[2]->repack == s.weights[0]->repack);
+         g_hot_admissions += loads.size(); // #183 gate counter
+         const uint64_t read_t0 = hot_now_ns();
+         struct read_timer { uint64_t t0; ~read_timer() { g_hot_read_ns += hot_now_ns() - t0; } } read_timer_{ read_t0 };

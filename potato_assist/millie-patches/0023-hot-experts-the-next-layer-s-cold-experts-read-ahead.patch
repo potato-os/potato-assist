@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 03:13:25 +0100
+Subject: [PATCH] hot experts: the next layer's cold experts read ahead (#190)
+
+At layer L the route op's threads score layer L+1's router against layer
+L's routing input (an int8 copy of each router, built from the file), rank
+the scores with L+1's residency bias, and thread 0 hands L+1's cold experts
+among the top eight to three reader threads, which read them into side
+buffers while L and L+1's attention compute. When L+1 admits an expert that
+was read ahead, its repack takes the bytes from there. The policy and the
+bytes are the same, so every output is too; only where an admission's bytes
+come from changes.
+
+On a Mac trace the next layer's float router catches half of its misses at
+top 8 for about one read per miss. On the 12R 64% of admissions come from
+the side buffers, 79-84% of those already complete; tg128 14.62 -> 15.29
+(prefetch off/on, one build, two interleaved rounds). The reader threads
+stay unpinned: kept off the compute cores they land on the little ones,
+where only 31% of the reads were ready in time. LLAMA_HOT_PREFETCH=0 turns
+it off, LLAMA_HOT_PREFETCH_N sets the rank cut.
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 619aa79..83957c0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1462,7 +1462,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (hot_cache) {
+         GGML_ASSERT(arch == LLM_ARCH_QWEN35MOE && n_expert == 256 && n_expert_used == 8);
+         GGML_ASSERT(!exp_probs_b && hparams.n_expert_groups <= 1);
+-        auto * route = llama_hot_route(hot_cache, ctx0, logits, il);
++        auto * route = llama_hot_route(hot_cache, ctx0, logits, il, cur);
+         selected_experts = ggml_view_2d(ctx0, route, 8, n_tokens, route->nb[1], 0);
+         hot_physical = ggml_view_2d(ctx0, route, 8, n_tokens, route->nb[1], 8*sizeof(int32_t));
+     } else {
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 263f4d6..8c64bc8 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -25,6 +25,9 @@
+ #    endif
+ 
+ #    include <algorithm>
++#    if defined(__ARM_NEON)
++#        include <arm_neon.h>
++#    endif
+ #    include <array>
+ #    include <atomic>
+ #    include <condition_variable>
+@@ -327,6 +330,7 @@ struct hot_range {
+     size_t offset, bytes;
+ };
+ 
++
+ // #185: the reader threads of LLAMA_HOT_COOP=2. One batch at a time: range i
+ // lands in bufs[i] and ready[i] then points at it.
+ struct hot_split_readers {
+@@ -436,11 +440,195 @@ static hot_split_readers & hot_split() {
+     return readers;
+ }
+ 
++// #190: expert prefetch. At layer L the next layer's router, applied to layer
++// L's routing input, predicts which experts L+1 will select; its cold ones are
++// read ahead into side buffers while L and L+1's attention compute. When L+1
++// admits an expert that was predicted, its repack takes the bytes from there
++// instead of waiting on flash. The policy and the bytes are unchanged, so the
++// outputs are too: only where the admission's bytes come from differs.
++// On a Mac trace of 128 greedy tokens the next router (float) finds half of
++// the next layer's misses at about one read per miss (top 8); on the 12R the
++// int8 copy here serves 64% of admissions. LLAMA_HOT_PREFETCH=0 turns it off,
++// LLAMA_HOT_PREFETCH_N sets the rank cut.
++
+ static bool hot_fast_topk() {
+     static const bool on = !getenv("LLAMA_HOT_FAST_TOPK") || atoi(getenv("LLAMA_HOT_FAST_TOPK")) != 0;
+     return on;
+ }
+ 
++static bool hot_prefetch_on() {
++    static const bool on = !getenv("LLAMA_HOT_PREFETCH") || atoi(getenv("LLAMA_HOT_PREFETCH")) != 0;
++    return on;
++}
++
++static int hot_prefetch_rank() {
++    static const int n = getenv("LLAMA_HOT_PREFETCH_N") ? std::max(1, std::min(32, atoi(getenv("LLAMA_HOT_PREFETCH_N")))) : 8;
++    return n;
++}
++
++struct hot_prefetch_entry {
++    enum { FREE = 0, CLAIMING = 1, READING = 2, READY = 3 };
++    std::atomic<int>          state{ FREE };
++    std::atomic<bool>         released{ false };
++    std::atomic<int>          left{ 0 };
++    int                       layer  = -1, expert = -1;
++    uint64_t                  token  = 0;
++    std::array<unsigned char *, 3>                    buf{};
++    std::array<std::atomic<const unsigned char *>, 3> data{};
++    size_t                    cap = 0;
++
++    void try_free() {
++        int r = READY;
++        state.compare_exchange_strong(r, FREE, std::memory_order_acq_rel);
++    }
++
++    const unsigned char * wait(int k) const {
++        const unsigned char * p;
++        while (!(p = data[k].load(std::memory_order_acquire))) {
++            hot_cpu_relax();
++        }
++        return p;
++    }
++};
++
++struct hot_prefetcher {
++    static constexpr int ENTRIES = 24;
++
++    struct range_job {
++        hot_prefetch_entry * e;
++        int                  k;
++        hot_range            r;
++    };
++
++    std::array<hot_prefetch_entry, ENTRIES> entries;
++    std::mutex                              m;
++    std::condition_variable                 cv;
++    std::vector<range_job>                  reads;
++    bool                                    stop = false;
++    std::vector<std::thread>                threads;
++    std::atomic<uint64_t> issued{ 0 }, used{ 0 }, ready_at_use{ 0 }, wait_ns{ 0 }, dropped{ 0 };
++
++    hot_prefetcher() {
++        for (int i = 0; i < 3; i++) {
++            threads.emplace_back([this] { read_loop(); });
++        }
++    }
++
++    ~hot_prefetcher() {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            stop = true;
++        }
++        cv.notify_all();
++        for (auto & t : threads) {
++            t.join();
++        }
++        for (auto & e : entries) {
++            for (auto * b : e.buf) {
++                free(b);
++            }
++        }
++    }
++
++    // Thread 0, at the target layer's admission, before any job runs.
++    hot_prefetch_entry * find(int layer, int expert, uint64_t token) {
++        for (auto & e : entries) {
++            const int st = e.state.load(std::memory_order_acquire);
++            if ((st == hot_prefetch_entry::READING || st == hot_prefetch_entry::READY) && e.layer == layer &&
++                e.expert == expert && e.token == token && !e.released.load(std::memory_order_relaxed)) {
++                used++;
++                ready_at_use += st == hot_prefetch_entry::READY;
++                return &e;
++            }
++        }
++        return nullptr;
++    }
++
++    // Thread 0, once the layer's admissions for `token` are done: every entry
++    // of this layer up to this token is spent, used or not.
++    void release(int layer, uint64_t token) {
++        for (auto & e : entries) {
++            const int st = e.state.load(std::memory_order_acquire);
++            if ((st == hot_prefetch_entry::READING || st == hot_prefetch_entry::READY) && e.layer == layer && e.token <= token) {
++                e.released.store(true, std::memory_order_seq_cst);
++                if (e.state.load(std::memory_order_seq_cst) == hot_prefetch_entry::READY) {
++                    e.try_free();
++                }
++            }
++        }
++    }
++
++    // Thread 0: read `expert` of `target` ahead for `token`. base: each expert
++    // tensor's fd, its offset in the file and the per-expert stride.
++    bool issue(int target, uint64_t token, int expert, const std::array<hot_range, 3> & base) {
++        hot_prefetch_entry * slot = nullptr;
++        for (auto & e : entries) {
++            int f = hot_prefetch_entry::FREE;
++            if (e.state.compare_exchange_strong(f, hot_prefetch_entry::CLAIMING, std::memory_order_acq_rel)) {
++                slot = &e;
++                break;
++            }
++        }
++        if (!slot) {
++            dropped++;
++            return false;
++        }
++        size_t need = 0;
++        for (int k = 0; k < 3; ++k) need = std::max(need, base[k].bytes + 8192);
++        if (need > slot->cap) {
++            for (auto *& b : slot->buf) {
++                free(b);
++                if (posix_memalign(reinterpret_cast<void **>(&b), 4096, need) != 0) {
++                    GGML_ABORT("hot-cache prefetch allocation failed");
++                }
++            }
++            slot->cap = need;
++        }
++        slot->layer  = target;
++        slot->expert = expert;
++        slot->token  = token;
++        slot->released.store(false, std::memory_order_relaxed);
++        slot->left.store(3, std::memory_order_relaxed);
++        for (auto & d : slot->data) d.store(nullptr, std::memory_order_relaxed);
++        slot->state.store(hot_prefetch_entry::READING, std::memory_order_release);
++        issued++;
++        std::lock_guard<std::mutex> lk(m);
++        for (int k = 0; k < 3; ++k) {
++            reads.push_back({ slot, k, { base[k].fd, base[k].offset + expert * base[k].bytes, base[k].bytes } });
++        }
++        return true;
++    }
++
++    void kick() { cv.notify_all(); }
++
++    void read_loop() {
++        for (;;) {
++            range_job j;
++            {
++                std::unique_lock<std::mutex> lk(m);
++                cv.wait(lk, [&] { return stop || !reads.empty(); });
++                if (stop) {
++                    return;
++                }
++                j = reads.front();
++                reads.erase(reads.begin());
++            }
++            j.e->data[j.k].store(hot_pread_into(j.r.fd, j.r.offset, j.r.bytes, j.e->buf[j.k]), std::memory_order_release);
++            if (j.e->left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++                j.e->state.store(hot_prefetch_entry::READY, std::memory_order_seq_cst);
++                if (j.e->released.load(std::memory_order_seq_cst)) {
++                    j.e->try_free();
++                }
++            }
++        }
++    }
++};
++
++static hot_prefetcher & hot_prefetch() {
++    static hot_prefetcher p;
++    return p;
++}
++
+ struct llama_hot_cache {
+     int                           capacity;
+     float                         bias;
+@@ -460,7 +648,6 @@ struct llama_hot_cache {
+         size_t        offset, stride;      // in the file
+         size_t        slot_stride = 0;     // in the slot tensor (differs when repacked)
+         bool          repack      = false; // QT_MS32K4 in the file, QT2_R or QT2_R4 in the slot (#185, #190)
+-
+         ~weight() { close(fd); }
+ 
+         // One expert's matrix from the file's layout into a slot's.
+@@ -482,6 +669,9 @@ struct llama_hot_cache {
+         size_t          offset;
+         size_t          bytes      = 0;
+         unsigned char * repack_dst = nullptr; // #185: read into scratch, repack into here
++        hot_prefetch_entry * pf    = nullptr; // #190: the bytes were read ahead
++        int                  pf_k  = 0;
++        int                  split = -1;      // the split readers' range index
+     };
+ 
+     struct layer_state {
+@@ -502,6 +692,8 @@ struct llama_hot_cache {
+         std::vector<read_job>                shared_jobs;
+         bool                                 published = false;
+         bool                                 split     = false; // LLAMA_HOT_COOP=2: the readers hold the bytes
++        std::array<float, 256>               pred_score{};         // #190: the next layer's predicted router
++        std::atomic<int>                     pred_done{ 0 };
+         std::array<int, 256>                 union_old_slots{}, union_indices{};
+         std::vector<int>                     union_experts, union_old_queue;
+         uint64_t                             union_old_tokens = 0;
+@@ -603,7 +795,12 @@ struct llama_hot_cache {
+             const uint64_t j0 = hot_now_ns();
+             if (s.split) {
+                 const read_job & job = s.shared_jobs[i];
+-                job.w->repack_into(hot_split().wait(i), job.repack_dst);
++                const uint64_t   w0  = job.pf ? hot_now_ns() : 0;
++                const unsigned char * src = job.pf ? job.pf->wait(job.pf_k) : hot_split().wait(job.split);
++                if (job.pf) {
++                    hot_prefetch().wait_ns += hot_now_ns() - w0;
++                }
++                job.w->repack_into(src, job.repack_dst);
+             } else {
+                 read_job_one(&s.shared_jobs[i]);
+             }
+@@ -654,10 +851,24 @@ struct llama_hot_cache {
+             s.split = repack && hot_coop_mode() == 2 && hot_split_reader_count() > 0;
+             if (s.split) {
+                 std::vector<hot_range> ranges;
+-                for (const auto & job : s.shared_jobs) {
++                for (size_t j = 0; j < s.shared_jobs.size(); ++j) {
++                    auto & job = s.shared_jobs[j];
++                    // jobs are weight-major: job j is weight j / n of load j % n
++                    const size_t n  = loads.size();
++                    const int    ex = loads[j % n].first;
++                    if (hot_prefetch_on() && !gpu_routing) {
++                        if (auto * e = hot_prefetch().find(s.layer_index, ex, s.tokens)) {
++                            job.pf   = e;
++                            job.pf_k = (int) (j / n);
++                            continue;
++                        }
++                    }
++                    job.split = (int) ranges.size();
+                     ranges.push_back({ job.w->fd, job.offset, job.bytes ? job.bytes : job.w->stride });
+                 }
+-                hot_split().publish(ranges);
++                if (!ranges.empty()) {
++                    hot_split().publish(ranges);
++                }
+             }
+             s.next_job.store(0, std::memory_order_relaxed);
+             s.jobs_done.store(0, std::memory_order_relaxed);
+@@ -683,6 +894,99 @@ struct llama_hot_cache {
+ 
+     std::map<int, std::unique_ptr<layer_state>> layers;
+ 
++    // #190: every layer's router as int8 rows, for predicting its experts from
++    // the previous layer's routing input.
++    struct q8_router {
++        int64_t             n = 0;
++        std::vector<int8_t> w;
++        std::array<float, 256> scale{};
++    };
++    std::map<int, q8_router> q8_routers;
++
++    void build_q8_router(int il, const float * data, int64_t n, int64_t rows) {
++        if (rows != 256 || n % 16 != 0) {
++            return;
++        }
++        auto & q = q8_routers[il];
++        q.n = n;
++        q.w.resize(256 * q.n);
++        for (int e = 0; e < 256; ++e) {
++            const float * row = data + e * n;
++            float amax = 0;
++            for (int64_t k = 0; k < q.n; ++k) amax = std::max(amax, std::fabs(row[k]));
++            const float id = amax > 0 ? 127.0f / amax : 0.0f;
++            for (int64_t k = 0; k < q.n; ++k) q.w[e * q.n + k] = (int8_t) std::lrint(row[k] * id);
++            q.scale[e] = amax / 127.0f;
++        }
++    }
++
++    // The rows [r0, r1) of layer t's predicted router scores from x.
++    static void predict_rows(const q8_router & q, const float * x, int r0, int r1, float * out) {
++        thread_local std::vector<int8_t> xq;
++        xq.resize(q.n);
++        float amax = 0;
++        for (int64_t k = 0; k < q.n; ++k) amax = std::max(amax, std::fabs(x[k]));
++        const float id = amax > 0 ? 127.0f / amax : 0.0f;
++        for (int64_t k = 0; k < q.n; ++k) xq[k] = (int8_t) std::lrint(x[k] * id);
++        const float xs = amax / 127.0f;
++        for (int e = r0; e < r1; ++e) {
++            const int8_t * row = q.w.data() + e * q.n;
++            int32_t acc = 0;
++#    if defined(__ARM_NEON)
++            int32x4_t a = vdupq_n_s32(0);
++            for (int64_t k = 0; k < q.n; k += 16) {
++                const int8x16_t wv = vld1q_s8(row + k), xv = vld1q_s8(xq.data() + k);
++                a = vpadalq_s16(a, vmull_s8(vget_low_s8(wv), vget_low_s8(xv)));
++                a = vpadalq_s16(a, vmull_high_s8(wv, xv));
++            }
++            acc = vaddvq_s32(a);
++#    else
++            for (int64_t k = 0; k < q.n; ++k) acc += row[k] * xq[k];
++#    endif
++            out[e] = acc * q.scale[e] * xs;
++        }
++    }
++
++    // Whether this route step predicts the next layer (every thread decides alike).
++    const q8_router * prefetch_target(const layer_state & s, const ggml_tensor * dst) const {
++        if (gpu_routing || !hot_prefetch_on() || !hot_cooperative_reads() || hot_coop_mode() != 2 || !dst->src[1] ||
++            dst->src[0]->ne[1] != 1) {
++            return nullptr;
++        }
++        auto q  = q8_routers.find(s.layer_index + 1);
++        auto lt = layers.find(s.layer_index + 1);
++        if (q == q8_routers.end() || lt == layers.end() || lt->second->weights.size() != 3 ||
++            dst->src[1]->ne[0] != q->second.n) {
++            return nullptr;
++        }
++        return &q->second;
++    }
++
++    // Thread 0: the next layer's cold experts among its predicted top-n, read ahead.
++    void prefetch_issue(const layer_state & s, const float * score) {
++        auto & ts  = *layers.at(s.layer_index + 1);
++        const int top = hot_prefetch_rank();
++        std::array<float, 256> biased;
++        std::array<int, 256>   idx;
++        for (int e = 0; e < 256; ++e) {
++            biased[e] = score[e] + (ts.policy.slots[e] >= 0 ? bias : 0.0f);
++            idx[e]    = e;
++        }
++        std::partial_sort(idx.begin(), idx.begin() + top, idx.end(), [&](int a, int b) { return biased[a] > biased[b]; });
++        std::array<hot_range, 3> base;
++        for (int k = 0; k < 3; ++k) base[k] = { ts.weights[k]->fd, ts.weights[k]->offset, ts.weights[k]->stride };
++        bool any = false;
++        for (int i = 0; i < top; ++i) {
++            if (ts.policy.slots[idx[i]] < 0) {
++                any |= hot_prefetch().issue(ts.layer_index, ts.tokens, idx[i], base);
++            }
++        }
++        if (any) {
++            hot_prefetch().kick();
++        }
++    }
++
++
+     layer_state & state(int il) {
+         auto & p = layers[il];
+         if (!p) {
+@@ -787,6 +1091,13 @@ struct llama_hot_cache {
+             const uint64_t mine = s.epoch.load(std::memory_order_acquire);
+             const uint64_t t0   = hot_now_ns();
+             s.arrived.fetch_add(1, std::memory_order_acq_rel);
++            // #190: while thread 0 routes, every thread scores its share of the
++            // next layer's experts; thread 0 issues the reads ahead.
++            const q8_router * pq = s.owner->prefetch_target(s, dst);
++            if (pq) {
++                predict_rows(*pq, (const float *) dst->src[1]->data, 256 * ith / nth, 256 * (ith + 1) / nth, s.pred_score.data());
++                s.pred_done.fetch_add(1, std::memory_order_acq_rel);
++            }
+             if (ith) {
+                 while (s.epoch.load(std::memory_order_acquire) == mine) {
+                     hot_spin_pause();
+@@ -803,6 +1114,13 @@ struct llama_hot_cache {
+             const uint64_t dt = hot_now_ns() - t0;
+             g_hot_arrive_ns += dt;
+             hot_atomic_max(g_hot_arrive_max_ns, dt);
++            if (pq) {
++                while (s.pred_done.load(std::memory_order_acquire) < nth) {
++                    hot_spin_pause();
++                }
++                s.pred_done.store(0, std::memory_order_relaxed);
++                s.owner->prefetch_issue(s, s.pred_score.data());
++            }
+         }
+         // Whatever this step does, the helpers are released exactly once.
+         struct epoch_guard {
+@@ -908,6 +1226,9 @@ struct llama_hot_cache {
+             auto loads = s.policy.update(selected);
+             if (!batch_union) {
+                 s.owner->load_admissions(s, loads);
++                if (hot_prefetch_on()) {
++                    hot_prefetch().release(s.layer_index, s.tokens);
++                }
+             }
+ 
+             auto * out = reinterpret_cast<int32_t *>(static_cast<char *>(dst->data) + token * dst->nb[1]);
+@@ -977,9 +1298,9 @@ struct llama_hot_cache {
+         s.weights.push_back(std::move(w));
+     }
+ 
+-    ggml_tensor * llama_hot_route(ggml_context * ctx, ggml_tensor * logits, int il) {
+-        ggml_tensor * args[] = { logits };
+-        auto * out = ggml_custom_4d(ctx, GGML_TYPE_I32, 16, logits->ne[1], 1, 1, args, 1, route_op,
++    ggml_tensor * llama_hot_route(ggml_context * ctx, ggml_tensor * logits, int il, ggml_tensor * x) {
++        ggml_tensor * args[] = { logits, x };
++        auto * out = ggml_custom_4d(ctx, GGML_TYPE_I32, 16, logits->ne[1], 1, 1, args, x ? 2 : 1, route_op,
+                                     hot_cooperative_reads() ? GGML_N_TASKS_MAX : 1, &state(il));
+         // Marker stored after the custom operation parameters.
+         if (gpu_routing) {
+@@ -1151,6 +1472,12 @@ llama_hot_cache * llama_hot_create(const gguf_context * ctx, int layers, int exp
+ }
+ 
+ void llama_hot_free(llama_hot_cache * cache) {
++    if (hot_prefetch_on()) {
++        auto & p = hot_prefetch();
++        fprintf(stderr, "HOT_PREFETCH issued=%llu used=%llu ready_at_use=%llu wait_ms=%.1f dropped=%llu\n",
++                (unsigned long long) p.issued.load(), (unsigned long long) p.used.load(), (unsigned long long) p.ready_at_use.load(),
++                p.wait_ns.load() / 1e6, (unsigned long long) p.dropped.load());
++    }
+     fprintf(stderr, "HOT_GATE decode_admissions=%llu prefill_cold_experts=%llu route_calls=%llu route_ms=%.1f read_ms=%.1f\n",
+             (unsigned long long) g_hot_admissions.load(), (unsigned long long) g_hot_union_cold.load(),
+             (unsigned long long) g_hot_route_calls.load(), g_hot_route_ns.load() / 1e6, g_hot_read_ns.load() / 1e6);
+@@ -1188,8 +1515,12 @@ ggml_type llama_hot_slot_type(const llama_hot_cache *, ggml_type file_type) {
+     return hot_interleave_experts() ? GGML_TYPE_QT2_R4 : GGML_TYPE_QT2_R;
+ }
+ 
+-ggml_tensor * llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer) {
+-    return cache->llama_hot_route(ctx, logits, layer);
++ggml_tensor * llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer, ggml_tensor * x) {
++    return cache->llama_hot_route(ctx, logits, layer, x);
++}
++
++void llama_hot_set_router_data(llama_hot_cache * cache, int layer, const float * data, int64_t n, int64_t rows) {
++    cache->build_q8_router(layer, data, n, rows);
+ }
+ 
+ ggml_tensor * llama_hot_union_weight(llama_hot_cache * cache, ggml_tensor * original, int layer) {
+@@ -1243,7 +1574,9 @@ ggml_type llama_hot_slot_type(const llama_hot_cache *, ggml_type file_type) {
+     return file_type;
+ }
+ 
+-ggml_tensor * llama_hot_route(llama_hot_cache *, ggml_context *, ggml_tensor *, int) {
++void llama_hot_set_router_data(llama_hot_cache *, int, const float *, int64_t, int64_t) {}
++
++ggml_tensor * llama_hot_route(llama_hot_cache *, ggml_context *, ggml_tensor *, int, ggml_tensor *) {
+     throw std::runtime_error("hot experts require the Metal backend");
+ }
+ 
+diff --git a/src/llama-hot-cache.h b/src/llama-hot-cache.h
+index f6d8a0c..8efbf75 100644
+--- a/src/llama-hot-cache.h
++++ b/src/llama-hot-cache.h
+@@ -17,7 +17,10 @@ void              llama_hot_bind(llama_hot_cache * cache, ggml_tensor * tensor,
+ // The type the slots hold: the file's, or QT2_R when this build repacks
+ // ternary experts as it admits them (#185).
+ ggml_type         llama_hot_slot_type(const llama_hot_cache * cache, ggml_type file_type);
+-ggml_tensor *     llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer);
++// x: the MoE block's input, the vector the router multiplied (#190: the next
++// layers' routers applied to it predict their experts).
++ggml_tensor *     llama_hot_route(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * logits, int layer, ggml_tensor * x);
++void              llama_hot_set_router_data(llama_hot_cache * cache, int layer, const float * data, int64_t n, int64_t rows);
+ ggml_tensor *     llama_hot_union_weight(llama_hot_cache * cache, ggml_tensor * original, int layer);
+ ggml_tensor *     llama_hot_union_finish(llama_hot_cache * cache, ggml_context * ctx, ggml_tensor * cur, int layer);
+ void              llama_hot_abort_pending(llama_hot_cache * cache);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 5e746b7..bbf91cf 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -8095,6 +8095,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+             return false;
+         }
+     }
++    if (hot_cache) {
++        // #190: the prefetch predictor's int8 copy of each router, built from
++        // the file whatever buffer the loaded weight lives in
++        for (int il = 0; il < (int) layers.size(); ++il) {
++            const ggml_tensor * r = layers[il].ffn_gate_inp;
++            const auto * w = r ? ml.get_weight(ggml_get_name(r)) : nullptr;
++            if (w && r->type == GGML_TYPE_F32 && ggml_n_dims(r) == 2) {
++                std::vector<float> data(ggml_nelements(r));
++                auto & file = ml.files.at(w->idx);
++                file->seek(w->offs, SEEK_SET);
++                file->read_raw(data.data(), data.size() * sizeof(float));
++                llama_hot_set_router_data(hot_cache, il, data.data(), r->ne[0], r->ne[1]);
++            }
++        }
++    }
+ 
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {

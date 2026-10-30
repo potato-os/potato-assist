@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 16:33:38 +0100
+Subject: [PATCH] tests: Millie 1.1's matmul shapes in test-backend-ops eval
+ and perf (#185)
+
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 860ca76..8301d35 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8839,6 +8839,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_falcon(2));
+ #endif
+ 
++    // #185: Millie 1.1's shapes, with column counts that exercise every tile tail.
++    for (int64_t n : { 1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 31, 33, 64 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_SYM16K, GGML_TYPE_F32,  512, n, 2048, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_SYM16K, GGML_TYPE_F32, 2048, n,  512, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32,  512, n, 2048, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 2048, n,  512, { 1, 1 }, { 1, 1 }));
++    }
++    for (int64_t n : { 1, 4, 32, 129, 512 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32,  16, 4, false,  512, n, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_SYM16K, GGML_TYPE_F32,  16, 4, false,  512, n, 2048));
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -9124,6 +9138,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+ 
++    // #185: Millie 1.1's matmuls at every column count a prefill or a decode
++    // gives them. Experts: 256 of them, 8 used, so a token count n puts about
++    // n/32 columns on each; dense projections see all n.
++    for (int64_t n : { 1, 2, 4, 8, 16, 32, 64, 128, 512 }) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 8192, 2048 }, { 4096, 2048 }, { 2048, 4096 }, { 512, 2048 }, { 2048, 512 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_SYM16K, GGML_TYPE_F32, mk.first, n, mk.second, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int64_t n : { 1, 32, 64, 128, 256, 512 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
++    }
++
+     return test_cases;
+ }
+ 

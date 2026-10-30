@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:28:39 +0100
+Subject: [PATCH] hot experts: top eight by one scan when the best nine are
+ strictly ordered, the network otherwise (#190)
+
+The CPU route sorted all 256 scores with a scalar bitonic network to take
+the top eight. When the nine best scores are strictly ordered (no ties, no
+NaN) the network's top eight are simply the eight largest, in order, and one
+scan finds them; otherwise the network still decides. The Mac greedy text is
+unchanged over ~25,000 routings, prefill included. 12R tg128 15.48 -> 15.61
+(one round, LLAMA_HOT_FAST_TOPK=0 against the default).
+
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 4531b34..263f4d6 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -436,6 +436,11 @@ static hot_split_readers & hot_split() {
+     return readers;
+ }
+ 
++static bool hot_fast_topk() {
++    static const bool on = !getenv("LLAMA_HOT_FAST_TOPK") || atoi(getenv("LLAMA_HOT_FAST_TOPK")) != 0;
++    return on;
++}
++
+ struct llama_hot_cache {
+     int                           capacity;
+     float                         bias;
+@@ -854,6 +859,34 @@ struct llama_hot_cache {
+                 scores[e]  = in[e] + (s.policy.slots[e] >= 0 ? bias : 0);
+                 indices[e] = e;
+             }
++            // #190: when the nine best scores are strictly ordered (no ties, no
++            // NaN) the network's top eight are simply the eight largest, in
++            // order; one scan finds them. Otherwise the network decides ties.
++            if (hot_fast_topk()) {
++                float v[9];
++                int   id[9];
++                int   n  = 0;
++                bool  ok = true;
++                for (int e = 0; e < 256 && ok; ++e) {
++                    const float x = scores[e];
++                    ok = !std::isnan(x);
++                    if (n == 9 && !(x > v[8])) {
++                        continue;
++                    }
++                    int j = n < 9 ? n++ : 8;
++                    while (j > 0 && x > v[j - 1]) {
++                        v[j] = v[j - 1]; id[j] = id[j - 1]; --j;
++                    }
++                    v[j] = x; id[j] = e;
++                }
++                for (int i = 0; ok && i < 8; ++i) {
++                    ok = v[i] > v[i + 1];
++                }
++                if (ok) {
++                    for (int i = 0; i < 8; ++i) indices[i] = id[i];
++                    goto hot_topk_done;
++                }
++            }
+             for (int k = 2; k <= 256; k *= 2) {
+                 for (int j = k / 2; j > 0; j /= 2) {
+                     for (int col = 0; col < 256; col++) {
+@@ -869,6 +902,7 @@ struct llama_hot_cache {
+                     }
+                 }
+             }
++        hot_topk_done:
+             std::vector<int> selected(indices.begin(), indices.begin() + 8);
+ 
+             auto loads = s.policy.update(selected);

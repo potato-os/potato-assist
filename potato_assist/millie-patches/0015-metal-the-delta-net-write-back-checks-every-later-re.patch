@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 23:19:53 +0100
+Subject: [PATCH] metal: the delta-net write-back checks every later reader;
+ CPY width in 64 bits (#185)
+
+When the kernel writes the recurrent cache, the state after its attention
+output is never written, so the look-ahead now also scans every node after
+the CPY, in this encoder or a later one, and keeps the copy if anything else
+reads that state (views are skipped: their consumers carry the offsets).
+Still 90 of 90 fused over a three-graph Millie run. The CPY's combined row
+width is computed in 64 bits before it is narrowed.
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index c238001..fa4a89e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -77,6 +77,10 @@ struct ggml_metal_op {
+         return ggml_graph_node(gf, idxs[i]);
+     }
+ 
++    // #185: the whole graph after node i, beyond this encoder's range
++    int graph_index(int i) const { return idxs[i]; }
++    const ggml_cgraph * graph() const { return gf; }
++
+     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
+         assert(use_fusion);
+         assert(i0 >= 0 && i0 < n_nodes());
+@@ -1658,6 +1662,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     if (ctx->use_fusion && !(op->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+         auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+         auto reads_state = [&](const ggml_tensor * t) { return t == op || (t->view_src == op && t->view_offs >= tail); };
++        // views read nothing themselves; their consumers carry the offsets
++        auto is_view = [](const ggml_tensor * t) {
++            return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
++                   t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
++        };
+         for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
+             const ggml_tensor * n     = ctx->node(j);
+             const ggml_tensor * snap  = n->src[0];
+@@ -1670,14 +1679,22 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+                 for (int k = idx + 1; k < j && clear; ++k) {
+                     const ggml_tensor * m = ctx->node(k);
+                     clear = base(m) != base(cache);
+-                    for (int i = 0; i < GGML_MAX_SRC && clear && m->src[i]; ++i) {
++                    for (int i = 0; i < GGML_MAX_SRC && clear && !is_view(m) && m->src[i]; ++i) {
+                         clear = base(m->src[i]) != base(cache) && !reads_state(m->src[i]);
+                     }
+                 }
++                // nor may anything after it read the state the kernel no longer
++                // writes, in this encoder or a later one
++                for (int k = ctx->graph_index(j) + 1; k < ctx->graph()->n_nodes && clear; ++k) {
++                    const ggml_tensor * m = ggml_graph_node(const_cast<ggml_cgraph *>(ctx->graph()), k);
++                    for (int i = 0; i < GGML_MAX_SRC && clear && !is_view(m) && m->src[i]; ++i) {
++                        clear = !reads_state(m->src[i]);
++                    }
++                }
+                 fused_cpy = clear ? n : nullptr;
+                 break;
+             }
+-            for (int i = 0; i < GGML_MAX_SRC && n->src[i]; ++i) {
++            for (int i = 0; i < GGML_MAX_SRC && !is_view(n) && n->src[i]; ++i) {
+                 if (reads_state(n->src[i])) {
+                     j = ctx->n_nodes(); // another reader of the state: leave it where it is
+                     break;
+@@ -1929,7 +1946,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+     // already nk0 and short rows are never batched. The recurrent conv state
+     // (three floats per channel) took one threadgroup of three threads per row.
+     const int max_nth = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+-    int nth = std::min<int>(nk0*ne01, max_nth);
++    int nth = (int) std::min<int64_t>((int64_t) nk0*ne01, max_nth);
+ 
+     // when rows are small, we can batch them together in a single threadgroup
+     int nrptg = 1;

@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 09:33:18 +0100
+Subject: [PATCH] state: sequence files leave the expert queue out (#209)
+
+state_seq_save_file and state_seq_load_file no longer write or read the
+hot-expert router state that every per-sequence state carried. A file
+outlives the load that wrote it, so the queue it held was another
+session's, and loading it re-read experts from storage. The in-memory
+state_seq_get_data and state_seq_set_data calls keep it, so context
+checkpoints and context growth are unchanged.
+---
+ src/llama-context.cpp | 15 +++++++++------
+ src/llama-context.h   |  5 +++--
+ 2 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c40ad37..82cc69a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2528,7 +2528,10 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
+     {
+         const size_t state_size = file.size() - file.tell();
+         llama_io_read_file io(&file);
+-        const size_t nread = state_seq_read_data(io, seq_id, 0);
++        // A file outlives the load that wrote it: the expert queue it would
++        // carry is another session's, and restoring it re-reads experts from
++        // storage (#209). In-memory state keeps it.
++        const size_t nread = state_seq_read_data(io, seq_id, 0, /*hot=*/false);
+         if (!nread) {
+             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+             return 0;
+@@ -2552,7 +2555,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
+ 
+     // save the context state using stream saving
+     llama_io_write_file io(&file);
+-    state_seq_write_data(io, seq_id, 0);
++    state_seq_write_data(io, seq_id, 0, /*hot=*/false);
+ 
+     const size_t res = file.tell();
+     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+@@ -2620,14 +2623,14 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
+     return io.n_bytes();
+ }
+ 
+-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool hot) {
+     GGML_UNUSED(seq_id);
+ 
+     if (memory) {
+         memory->state_write(io, seq_id, flags);
+     }
+ 
+-    if (model.hot_cache) {
++    if (hot && model.hot_cache) {
+         const auto data = llama_hot_save_state(model.hot_cache);
+         const uint64_t size = data.size();
+         io.write(&size, sizeof(size));
+@@ -2636,14 +2639,14 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
+     return io.n_bytes();
+ }
+ 
+-size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool hot) {
+     GGML_UNUSED(seq_id);
+ 
+     if (memory) {
+         memory->state_read(io, seq_id, flags);
+     }
+ 
+-    if (model.hot_cache) {
++    if (hot && model.hot_cache) {
+         uint64_t size;
+         io.read_to(&size, sizeof(size));
+         if (size > 1024*1024) throw std::runtime_error("invalid hot expert state size");
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a9988f1..11f5e92 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -239,8 +239,9 @@ private:
+     size_t state_write_data(llama_io_write_i & io);
+     size_t state_read_data (llama_io_read_i  & io);
+ 
+-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
++    // `hot`: the expert queue rides along. A file save or load leaves it out.
++    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool hot = true);
++    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool hot = true);
+ 
+     //
+     // members
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:02:02 +0100
+Subject: [PATCH] cpu: MR x NR tiles for Q4_SYM16K and QT_MS32K4 on ARM
+ dotprod, bit-identical to the GEMVs (#185)
+
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index 1d4b71e..58e597c 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -531,6 +531,231 @@ void ggml_vec_dot_q4_sym16k_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
+ #endif
+ }
+ 
++// #185: tile kernels for Millie's two weight types. One call covers rows
++// [0, nr) of `vx` (row stride `bx`) against `nc` Q8_0 columns `vy[c]` and
++// writes dst[c][r]. Each weight block is decoded once per MR rows and reused
++// across NR columns; each activation block is loaded once per NR columns and
++// reused across MR rows. Per (row, column) the arithmetic is the GEMV's, in
++// its order, so every output is bit-identical to ggml_vec_dot_*_q8_0.
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++#define MILLIE_TILE_MR_MAX 8
++#define MILLIE_TILE_NR_MAX 8
++
++static inline __attribute__((always_inline)) void q4_sym16k_q8_0_tile(
++        const int MR, const int NR, const int nb, const uint8_t * GGML_RESTRICT vx, const size_t bx,
++        const block_q8_0 * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    static const int8_t klut[16] = { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 };
++    const int8x16_t  lut = vld1q_s8(klut);
++    const uint8x16_t m4b = vdupq_n_u8(0x0F);
++
++    float sums[MILLIE_TILE_MR_MAX][MILLIE_TILE_NR_MAX];
++    for (int r = 0; r < MR; ++r) for (int c = 0; c < NR; ++c) sums[r][c] = 0.0f;
++
++    for (int i = 0; i < nb; ++i) {
++        int8x16_t   we[MILLIE_TILE_MR_MAX][4], wo[MILLIE_TILE_MR_MAX][4];
++        float32x4_t sc0[MILLIE_TILE_MR_MAX], sc1[MILLIE_TILE_MR_MAX];
++        float       d[MILLIE_TILE_MR_MAX];
++        for (int r = 0; r < MR; ++r) {
++            const block_q4_sym16k * GGML_RESTRICT x = (const block_q4_sym16k *) (vx + (size_t) (r0 + r) * bx) + i;
++            d[r] = GGML_CPU_FP16_TO_FP32(x->d);
++            for (int t = 0; t < 4; ++t) {
++                const uint8x16_t q = vld1q_u8(x->qs + 16*t);
++                we[r][t] = vqtbl1q_s8(lut, vandq_u8  (q, m4b));
++                wo[r][t] = vqtbl1q_s8(lut, vshrq_n_u8(q, 4));
++            }
++            const int16x8_t sc16 = vmovl_s8(vld1_s8(x->scales));
++            sc0[r] = vcvtq_f32_s32(vmovl_s16(vget_low_s16 (sc16)));
++            sc1[r] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(sc16)));
++        }
++        for (int c = 0; c < NR; ++c) {
++            const block_q8_0 * GGML_RESTRICT y = ys[c] + 4*i;
++            int8x16x2_t yv[4];
++            float d8h[4];
++            for (int t = 0; t < 4; ++t) {
++                yv[t]  = vld2q_s8(y[t].qs);
++                d8h[t] = 0.5f * GGML_CPU_FP16_TO_FP32(y[t].d);
++            }
++            const float32x4_t d80 = { d8h[0], d8h[0], d8h[1], d8h[1] };
++            const float32x4_t d81 = { d8h[2], d8h[2], d8h[3], d8h[3] };
++            for (int r = 0; r < MR; ++r) {
++                int32x4_t p[4];
++                for (int t = 0; t < 4; ++t) {
++                    const int32x4_t pt = ggml_vdotq_s32(vdupq_n_s32(0), we[r][t], yv[t].val[0]);
++                    p[t] = ggml_vdotq_s32(pt, wo[r][t], yv[t].val[1]);
++                }
++                const int32x4_t g0 = vpaddq_s32(p[0], p[1]);
++                const int32x4_t g1 = vpaddq_s32(p[2], p[3]);
++                float32x4_t accv = vdupq_n_f32(0.0f);
++                accv = vfmaq_f32(accv, vcvtq_f32_s32(g0), vmulq_f32(sc0[r], d80));
++                accv = vfmaq_f32(accv, vcvtq_f32_s32(g1), vmulq_f32(sc1[r], d81));
++                sums[r][c] += d[r] * vaddvq_f32(accv);
++            }
++        }
++    }
++    for (int c = 0; c < NR; ++c) for (int r = 0; r < MR; ++r) dst[c][r0 + r] = sums[r][c];
++}
++
++static inline __attribute__((always_inline)) void qt_ms32k4_q8_0_tile(
++        const int MR, const int NR, const int nb, const uint8_t * GGML_RESTRICT vx, const size_t bx,
++        const block_q8_0 * const * GGML_RESTRICT ys, float * const * GGML_RESTRICT dst, const int r0) {
++    float sums[MILLIE_TILE_MR_MAX][MILLIE_TILE_NR_MAX];
++    for (int r = 0; r < MR; ++r) for (int c = 0; c < NR; ++c) sums[r][c] = 0.0f;
++
++    for (int i = 0; i < nb; ++i) {
++        // The GEMV's decode, once per row: ternary values for the 8 sub-blocks
++        // (a zero sub-block decodes to zeros, whose dot is the GEMV's 0).
++        int8x16_t q[MILLIE_TILE_MR_MAX][QKT_MS32K_SUPER][2];
++        float     sc[MILLIE_TILE_MR_MAX][QKT_MS32K_SUPER];
++        float     d[MILLIE_TILE_MR_MAX];
++        for (int r = 0; r < MR; ++r) {
++            const block_qt_ms32k4 * GGML_RESTRICT x = (const block_qt_ms32k4 *) (vx + (size_t) (r0 + r) * bx) + i;
++            d[r] = GGML_CPU_FP16_TO_FP32(x->d);
++            uint64_t s_lo, s_hi;
++            memcpy(&s_lo, x->signs,     8);
++            memcpy(&s_hi, x->signs + 8, 8);
++            unsigned start = 0;
++            for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++                sc[r][sb] = (float)((sb & 1) ? (x->scales[sb >> 1] >> 4) : (x->scales[sb >> 1] & 0x0F));
++                uint32_t m;
++                memcpy(&m, x->mask + 4*sb, 4);
++                if (m == 0) {
++                    q[r][sb][0] = vdupq_n_s8(0);
++                    q[r][sb][1] = vdupq_n_s8(0);
++                    continue;
++                }
++                const uint32_t win = (uint32_t)(start < 64
++                    ? ((s_lo >> start) | (start ? (s_hi << (64 - start)) : 0))
++                    : (s_hi >> (start - 64)));
++                const uint32_t mA = m & 0xff, mB = (m >> 8) & 0xff, mC = (m >> 16) & 0xff, mD = m >> 24;
++                const uint32_t counts = vget_lane_u32(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(m))), 0) * 0x01010101u;
++                const uint8_t w0 = (uint8_t)win;
++                const uint8_t w1 = (uint8_t)(win >> (counts & 255));
++                const uint8_t w2 = (uint8_t)(win >> ((counts >> 8) & 255));
++                const uint8_t w3 = (uint8_t)(win >> ((counts >> 16) & 255));
++                const uint8x16_t winv0 = vcombine_u8(vdup_n_u8(w0), vdup_n_u8(w1));
++                const uint8x16_t winv1 = vcombine_u8(vdup_n_u8(w2), vdup_n_u8(w3));
++                const uint8x16_t P0 = vcombine_u8(vcreate_u8(tern_sign_bit[mA]), vcreate_u8(tern_sign_bit[mB]));
++                const uint8x16_t P1 = vcombine_u8(vcreate_u8(tern_sign_bit[mC]), vcreate_u8(tern_sign_bit[mD]));
++                const uint8x16_t mFF0 = vtstq_u8(P0, P0);
++                const uint8x16_t mFF1 = vtstq_u8(P1, P1);
++                const uint8x16_t sFF0 = vtstq_u8(winv0, P0);
++                const uint8x16_t sFF1 = vtstq_u8(winv1, P1);
++                q[r][sb][0] = vreinterpretq_s8_u8(vsubq_u8(vaddq_u8(sFF0, sFF0), mFF0));
++                q[r][sb][1] = vreinterpretq_s8_u8(vsubq_u8(vaddq_u8(sFF1, sFF1), mFF1));
++                start += counts >> 24;
++            }
++        }
++        for (int c = 0; c < NR; ++c) {
++            const block_q8_0 * GGML_RESTRICT y = ys[c] + QKT_MS32K_SUPER*i;
++            int8x16_t yv[QKT_MS32K_SUPER][2];
++            float d8[QKT_MS32K_SUPER];
++            for (int sb = 0; sb < QKT_MS32K_SUPER; ++sb) {
++                yv[sb][0] = vld1q_s8(y[sb].qs);
++                yv[sb][1] = vld1q_s8(y[sb].qs + 16);
++                d8[sb]    = GGML_CPU_FP16_TO_FP32(y[sb].d);
++            }
++            for (int r = 0; r < MR; ++r) {
++                float32x4_t accv = vdupq_n_f32(0.0f);
++                for (int g4 = 0; g4 < 2; ++g4) {
++                    int32x4_t p[4];
++                    for (int t = 0; t < 4; ++t) {
++                        const int sb = 4*g4 + t;
++                        const int32x4_t pt = ggml_vdotq_s32(vdupq_n_s32(0), q[r][sb][0], yv[sb][0]);
++                        p[t] = ggml_vdotq_s32(pt, q[r][sb][1], yv[sb][1]);
++                    }
++                    const int32x4_t grp = vpaddq_s32(vpaddq_s32(p[0], p[1]), vpaddq_s32(p[2], p[3]));
++                    accv = vfmaq_f32(accv, vcvtq_f32_s32(grp), vmulq_f32(vld1q_f32(&sc[r][4*g4]), vld1q_f32(&d8[4*g4])));
++                }
++                sums[r][c] += d[r] * vaddvq_f32(accv);
++            }
++        }
++    }
++    for (int c = 0; c < NR; ++c) for (int r = 0; r < MR; ++r) dst[c][r0 + r] = sums[r][c];
++}
++
++#define MILLIE_TILE_FN(type, MR, NR) \
++    static void type##_q8_0_tile_##MR##x##NR(int nb, const uint8_t * vx, size_t bx, \
++            const block_q8_0 * const * ys, float * const * dst, int r0) { \
++        type##_q8_0_tile(MR, NR, nb, vx, bx, ys, dst, r0); \
++    }
++#define MILLIE_TILE_SHAPES(type) \
++    MILLIE_TILE_FN(type, 1, 1) MILLIE_TILE_FN(type, 2, 1) MILLIE_TILE_FN(type, 4, 1) MILLIE_TILE_FN(type, 8, 1) \
++    MILLIE_TILE_FN(type, 1, 2) MILLIE_TILE_FN(type, 2, 2) MILLIE_TILE_FN(type, 4, 2) MILLIE_TILE_FN(type, 8, 2) \
++    MILLIE_TILE_FN(type, 1, 4) MILLIE_TILE_FN(type, 2, 4) MILLIE_TILE_FN(type, 4, 4) MILLIE_TILE_FN(type, 8, 4) \
++    MILLIE_TILE_FN(type, 1, 8) MILLIE_TILE_FN(type, 2, 8) MILLIE_TILE_FN(type, 4, 8) MILLIE_TILE_FN(type, 8, 8)
++MILLIE_TILE_SHAPES(q4_sym16k)
++MILLIE_TILE_SHAPES(qt_ms32k4)
++
++typedef void (*millie_tile_fn)(int, const uint8_t *, size_t, const block_q8_0 * const *, float * const *, int);
++#define MILLIE_TILE_ROW(type, MR) { type##_q8_0_tile_##MR##x1, type##_q8_0_tile_##MR##x2, NULL, type##_q8_0_tile_##MR##x4, NULL, NULL, NULL, type##_q8_0_tile_##MR##x8 }
++static const millie_tile_fn millie_tiles_q4[8][8] = {
++    [0] = MILLIE_TILE_ROW(q4_sym16k, 1), [1] = MILLIE_TILE_ROW(q4_sym16k, 2),
++    [3] = MILLIE_TILE_ROW(q4_sym16k, 4), [7] = MILLIE_TILE_ROW(q4_sym16k, 8),
++};
++static const millie_tile_fn millie_tiles_qt[8][8] = {
++    [0] = MILLIE_TILE_ROW(qt_ms32k4, 1), [1] = MILLIE_TILE_ROW(qt_ms32k4, 2),
++    [3] = MILLIE_TILE_ROW(qt_ms32k4, 4), [7] = MILLIE_TILE_ROW(qt_ms32k4, 8),
++};
++
++// MILLIE_TILE_Q4 / MILLIE_TILE_QT = "<MR>x<NR>" pick a shape per type (MR, NR
++// in 1, 2, 4, 8); "0" turns the type's tiles off. Read once.
++static void millie_tile_shape(const char * var, int dflt_mr, int dflt_nr, int * mr, int * nr) {
++    *mr = dflt_mr; *nr = dflt_nr;
++    const char * e = getenv(var);
++    if (!e) return;
++    int a = 0, b = 0;
++    if (sscanf(e, "%dx%d", &a, &b) == 2 && (a == 1 || a == 2 || a == 4 || a == 8) && (b == 1 || b == 2 || b == 4 || b == 8)) {
++        *mr = a; *nr = b;
++    } else {
++        *mr = 0; *nr = 0;
++    }
++}
++
++static inline int millie_fit(int want, int left) {
++    int k = want < left ? want : left;
++    return k >= 8 ? 8 : k >= 4 ? 4 : k >= 2 ? 2 : 1;
++}
++
++// Full MR x NR tiles, then the largest power-of-two tiles that fit the tails.
++static void millie_gemm(const millie_tile_fn (*tiles)[8], int MR, int NR, int nb, int nr, int nc,
++        const uint8_t * vx, size_t bx, const void * const * vy, float * const * dst) {
++    const block_q8_0 * const * ys = (const block_q8_0 * const *) vy;
++    for (int c = 0; c < nc;) {
++        const int kc = millie_fit(NR, nc - c);
++        for (int r0 = 0; r0 < nr;) {
++            const int kr = millie_fit(MR, nr - r0);
++            tiles[kr - 1][kc - 1](nb, vx, bx, ys + c, dst + c, r0);
++            r0 += kr;
++        }
++        c += kc;
++    }
++}
++
++int ggml_gemm_q4_sym16k_q8_0_enabled(void) {
++    static int mr = -1, nr;
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nr);
++    return mr > 0;
++}
++
++int ggml_gemm_qt_ms32k4_q8_0_enabled(void) {
++    static int mr = -1, nr;
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nr);
++    return mr > 0;
++}
++
++void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
++    static int mr = -1, nrr;
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_Q4", 4, 4, &mr, &nrr);
++    millie_gemm(millie_tiles_q4, mr, nrr, n / QK4_SYM16K, nr, nc, vx, bx, vy, dst);
++}
++
++void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst) {
++    static int mr = -1, nrr;
++    if (mr < 0) millie_tile_shape("MILLIE_TILE_QT", 4, 4, &mr, &nrr);
++    millie_gemm(millie_tiles_qt, mr, nrr, n / QKT_MS32K, nr, nc, vx, bx, vy, dst);
++}
++#endif
++
+ // SYM16 family: integer inner product via the doubling identity
+ // d*(c-7.5) = (d/2)*(2c-15) (q4) / d*(c-1.5) = (d/2)*(2c-3) (q2);
+ // the 0.5 is folded into the final per-group UE4M3 scale multiply.
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f5e39bd..ff51ff6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1207,6 +1207,23 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ 
+ // ggml_compute_forward_mul_mat
+ 
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++typedef void (*ggml_gemm_tile_t)(int, int, int, const void *, size_t, const void * const *, float * const *);
++
++static ggml_gemm_tile_t ggml_cpu_gemm_tile(enum ggml_type type, enum ggml_type vec_dot_type) {
++    if (vec_dot_type != GGML_TYPE_Q8_0) {
++        return NULL;
++    }
++    if (type == GGML_TYPE_Q4_SYM16K && ggml_gemm_q4_sym16k_q8_0_enabled()) {
++        return ggml_gemm_q4_sym16k_q8_0;
++    }
++    if (type == GGML_TYPE_QT_MS32K4 && ggml_gemm_qt_ms32k4_q8_0_enabled()) {
++        return ggml_gemm_qt_ms32k4_q8_0;
++    }
++    return NULL;
++}
++#endif
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1254,6 +1271,27 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     // 16 * 2, accounting for mmla kernels
+     float tmp[32];
+ 
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    // #185: Millie's two weight types take tiles once a chunk has two columns.
++    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
++    if (gemm && num_rows_per_vec_dot == 1 && ir1_end - ir1_start > 1 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
++        const void * ys[16];
++        float * dsts[16];
++        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
++            const int nc = (int) (MIN(iir1 + blck_1, ir1_end) - iir1);
++            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
++                for (int k = 0; k < nc; ++k) {
++                    const int64_t ir1 = iir1 + k;
++                    ys[k] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type ? ir1 * row_size : ir1 * nb11);
++                    dsts[k] = (float *) ((char *) dst->data + ir1 * nb1) + iir0;
++                }
++                gemm(ne00, (int) (MIN(iir0 + blck_0, ir0_end) - iir0), nc, (const char *) src0->data + iir0 * nb01, nb01, ys, dsts);
++            }
++        }
++        return;
++    }
++#endif
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+@@ -1528,6 +1566,30 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+     float tmp[16];
+ 
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    // #185: an expert with two or more columns in this chunk takes tiles.
++    ggml_gemm_tile_t const gemm = ggml_cpu_gemm_tile(type, vec_dot_type);
++    if (gemm && ir1_end - ir1_start > 1) {
++        const void * ys[16];
++        float * dsts[16];
++        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
++            const int nc = (int) (MIN(iir1 + blck_1, ir1_end) - iir1);
++            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
++                for (int k = 0; k < nc; ++k) {
++                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + k);
++                    const int64_t i11 = row_mapping.i1 % ne11;
++                    const int64_t i12 = row_mapping.i2;
++                    ys[k] = (const char *) wdata +
++                        (src1_cont || src1->type != vec_dot_type ? (i11 + i12*ne11)*row_size : (i11*nb11 + i12*nb12));
++                    dsts[k] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2)) + iir0;
++                }
++                gemm(ne00, (int) (MIN(iir0 + blck_0, ir0_end) - iir0), nc, src0_cur + iir0*nb01, nb01, ys, dsts);
++            }
++        }
++        return;
++    }
++#endif
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
+index f7734e2..ea01db0 100644
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -60,6 +60,13 @@ void ggml_vec_dot_qt_ms32k4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t
+ void quantize_row_qt_ms32k4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+ void ggml_vec_dot_q1_sym32k_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_sym16k_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++
++// #185: MR x NR tiles on ARM dotprod, bit-identical to the GEMVs above.
++// dst[c][r] = row r of vx (stride bx) . column vy[c], for r < nr, c < nc.
++int  ggml_gemm_q4_sym16k_q8_0_enabled(void);
++int  ggml_gemm_qt_ms32k4_q8_0_enabled(void);
++void ggml_gemm_q4_sym16k_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst);
++void ggml_gemm_qt_ms32k4_q8_0(int n, int nr, int nc, const void * vx, size_t bx, const void * const * vy, float * const * dst);
+ void ggml_vec_dot_q1_sym32k_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_sym16k_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void quantize_row_q1_sym32k(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

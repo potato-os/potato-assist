@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:22:11 +0100
+Subject: [PATCH] cpu: one token's QT2_R4 experts share one queue of 32-row
+ chunks (#190)
+
+At one token each expert's 512 rows fell back to a static five-way split,
+expert after expert, so the X3 idled after each share. A token's experts
+now take 32-row chunks from one queue. Each row's arithmetic is unchanged.
+Measured together with the next commit: 12R tg128 14.52 -> 15.01.
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f11791b..6241db0 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1787,8 +1787,38 @@ static void ggml_compute_forward_mul_mat_id(
+         *current_chunk_ctr = nth;
+     }
+ 
++    // #190: one token over QT2_R4 slots: one queue of 32-row chunks across
++    // every selected expert, so the faster cores keep taking work instead of
++    // each expert's rows being split five ways in turn.
++    const bool one_queue = type == GGML_TYPE_QT2_R4 && ids->ne[1] == 1 && ne01 % 32 == 0 && n_ids <= 64;
++    if (one_queue && ith == 0) {
++        ggml_threadpool_chunk_set(params->threadpool, nth);
++    }
++
+     ggml_barrier(params->threadpool);
+ 
++    if (one_queue) {
++        const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++        const int64_t per     = ne01 / 32;
++        int used[64]; // the token's experts, at most n_ids
++        int n_used = 0;
++        for (int a = 0; a < n_as && n_used < 64; ++a) {
++            if (matrix_row_counts[a] > 0) {
++                used[n_used++] = a;
++            }
++        }
++        const int64_t total = per * n_used;
++        for (int64_t c = ith; c < total; c = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++            const int     cur_a = used[c / per];
++            const int64_t r0    = (c % per) * 32;
++            ggml_compute_forward_mul_mat_id_one_chunk(dst, src0, src1, ids, cur_a, r0, r0 + 32, 0, matrix_row_counts[cur_a],
++                                                      (const char *) src0->data + cur_a * nb02, matrix_rows, row_size,
++                                                      src1_cont, wdata);
++        }
++        return;
++    }
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 

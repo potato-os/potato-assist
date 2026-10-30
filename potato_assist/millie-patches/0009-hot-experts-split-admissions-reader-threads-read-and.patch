@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 21:06:20 +0100
+Subject: [PATCH] hot experts: split admissions, reader threads read and
+ compute threads repack (#185)
+
+LLAMA_HOT_COOP=1 (the compute threads read and repack) put a blocking pread
+on every compute thread; one that sleeps can come back on a busy core, and
+reps collapsed to 1.2-4 tok/s beside 12. In the new default, LLAMA_HOT_COOP=2,
+the reader threads read each range into their own staging and the compute
+threads repack it into its slot as it lands, spinning, never sleeping.
+Unpinned it holds 12.31 tok/s over six reps on the 12R (11.97-12.57), and
+12.72 pinned to the big cores, where mode 0 gives 12.68.
+
+The cooperative step now waits for every thread to arrive before thread 0
+publishes, which is race-free whatever the thread count, and the job list
+stays in place until the next step: a helper can still be reading it after
+thread 0 sees every job done. HOT_COOP reports the arrival and helper waits.
+
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 8c2ec44..c2a15ef 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -25,7 +25,10 @@
+ #    endif
+ 
+ #    include <algorithm>
++#    include <array>
+ #    include <atomic>
++#    include <condition_variable>
++#    include <mutex>
+ #    include <thread>
+ #    include <cerrno>
+ #    include <cmath>
+@@ -196,15 +199,25 @@ static void hot_pread_exact(int fd, unsigned char * dst, size_t bytes, size_t of
+ // #185: with the cache on the CPU the admission reads and repacks run on the
+ // compute threads, which are otherwise spinning at the barrier on the big
+ // cores while the reader pool's threads compete for whatever is left.
+-static bool hot_cooperative_reads() {
++//
++// LLAMA_HOT_COOP: 0 = the reader pool does it all; 1 = the compute threads
++// read and repack; 2 (default) = reader threads read and the compute threads
++// repack each range as it lands. A compute thread that sleeps in pread comes
++// back slow: mode 1 on the 12R ran reps at 3.5 tok/s beside reps at 12.5, and
++// in mode 2 no compute thread ever blocks.
++static int hot_coop_mode() {
+ #    if defined(LLAMA_HOT_METAL)
+-    return false;
++    return 0;
+ #    else
+-    static const bool on = !getenv("LLAMA_HOT_COOP") || atoi(getenv("LLAMA_HOT_COOP")) != 0;
+-    return on;
++    static const int mode = getenv("LLAMA_HOT_COOP") ? atoi(getenv("LLAMA_HOT_COOP")) : 2;
++    return mode;
+ #    endif
+ }
+ 
++static bool hot_cooperative_reads() {
++    return hot_coop_mode() != 0;
++}
++
+ static bool hot_repack_experts() {
+ #    if defined(LLAMA_HOT_METAL)
+     return false;
+@@ -229,11 +242,175 @@ static bool metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+ 
+ static std::atomic<uint64_t> g_hot_admissions{ 0 }, g_hot_union_cold{ 0 }; // #183 gate counters
+ static std::atomic<uint64_t> g_hot_route_ns{ 0 }, g_hot_read_ns{ 0 }, g_hot_route_calls{ 0 };
++// LAB: cooperative-admission waits (thread 0's arrival wait, helpers' time in the op, slowest job)
++static std::atomic<uint64_t> g_hot_arrive_ns{ 0 }, g_hot_arrive_max_ns{ 0 }, g_hot_helper_ns{ 0 }, g_hot_helper_max_ns{ 0 }, g_hot_job_max_ns{ 0 };
++static void hot_atomic_max(std::atomic<uint64_t> & a, uint64_t v) {
++    uint64_t cur = a.load(std::memory_order_relaxed);
++    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
++}
+ #    include <chrono>
+ static uint64_t hot_now_ns() {
+     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
+ 
++// A short pause, not a yield: the scheduler takes milliseconds to hand a
++// yielded thread its core back, and these waits are tens of microseconds.
++static inline void hot_cpu_relax() {
++#    if defined(__aarch64__) || defined(__arm__)
++    __asm__ __volatile__("yield" ::: "memory");
++#    elif defined(__x86_64__) || defined(__i386__)
++    __asm__ __volatile__("pause" ::: "memory");
++#    else
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++#    endif
++}
++
++// #185: reads [offset, offset + bytes) into `buf` (4 KiB aligned, at least
++// bytes + 8 KiB) and returns where the range starts in it.
++static const unsigned char * hot_pread_into(int fd, size_t offset, size_t bytes, unsigned char * buf) {
++#    if defined(__APPLE__)
++    const size_t lo = offset, hi = offset + bytes;
++#    else
++    const bool   direct = hot_direct_reads();
++    const size_t lo     = direct ? offset & ~size_t(4095) : offset;
++    const size_t hi     = direct ? (offset + bytes + 4095) & ~size_t(4095) : offset + bytes;
++#    endif
++    size_t done = 0;
++    while (done < hi - lo) {
++        ssize_t n = pread(fd, buf + done, hi - lo - done, lo + done);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n == 0 && done >= (offset - lo) + bytes) {
++            break; // the aligned span ran past the end of the file
++        }
++        if (n <= 0) {
++            GGML_ABORT("hot-cache expert read failed: %s", strerror(errno));
++        }
++        done += n;
++    }
++#    if !defined(__APPLE__)
++    if (!direct) {
++        posix_fadvise(fd, offset, bytes, POSIX_FADV_DONTNEED);
++    }
++#    endif
++    return buf + (offset - lo);
++}
++
++struct hot_range {
++    int    fd;
++    size_t offset, bytes;
++};
++
++// #185: the reader threads of LLAMA_HOT_COOP=2. One batch at a time: range i
++// lands in bufs[i] and ready[i] then points at it.
++struct hot_split_readers {
++    static constexpr size_t MAX = 32;
++
++    std::vector<std::thread>                         threads;
++    std::mutex                                       m;
++    std::condition_variable                          cv;
++    uint64_t                                         generation = 0;
++    bool                                             stop       = false;
++    std::vector<hot_range>                           ranges;
++    std::atomic<size_t>                              next{ 0 };
++    std::atomic<int>                                 busy{ 0 };
++    std::array<std::atomic<const unsigned char *>, MAX> ready{};
++    std::array<unsigned char *, MAX>                 bufs{};
++    size_t                                           cap = 0;
++
++    explicit hot_split_readers(int n) {
++        for (int i = 0; i < n; i++) {
++            threads.emplace_back([this] { loop(); });
++        }
++    }
++
++    ~hot_split_readers() {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            stop = true;
++        }
++        cv.notify_all();
++        for (auto & t : threads) {
++            t.join();
++        }
++        for (auto * b : bufs) {
++            free(b);
++        }
++    }
++
++    // One publisher at a time, after the previous batch has been consumed.
++    // Readers join a batch only under the lock, so none is mid-batch here.
++    void publish(const std::vector<hot_range> & rs) {
++        GGML_ASSERT(rs.size() <= MAX);
++        std::unique_lock<std::mutex> lk(m);
++        while (busy.load(std::memory_order_acquire)) {
++            hot_cpu_relax();
++        }
++        size_t need = 0;
++        for (const auto & r : rs) {
++            need = std::max(need, r.bytes + 8192);
++        }
++        if (need > cap) {
++            for (auto *& b : bufs) {
++                free(b);
++                if (posix_memalign(reinterpret_cast<void **>(&b), 4096, need) != 0) {
++                    GGML_ABORT("hot-cache staging allocation failed");
++                }
++            }
++            cap = need;
++        }
++        for (size_t i = 0; i < rs.size(); i++) {
++            ready[i].store(nullptr, std::memory_order_relaxed);
++        }
++        ranges = rs;
++        next.store(0, std::memory_order_relaxed);
++        ++generation;
++        lk.unlock();
++        cv.notify_all();
++    }
++
++    const unsigned char * wait(size_t i) {
++        const unsigned char * p;
++        while (!(p = ready[i].load(std::memory_order_acquire))) {
++            hot_cpu_relax();
++        }
++        return p;
++    }
++
++    void loop() {
++        uint64_t seen = 0;
++        for (;;) {
++            size_t n;
++            {
++                std::unique_lock<std::mutex> lk(m);
++                cv.wait(lk, [&] { return stop || generation != seen; });
++                if (stop) {
++                    return;
++                }
++                seen = generation;
++                n    = ranges.size();
++                busy.fetch_add(1, std::memory_order_acq_rel);
++            }
++            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) {
++                ready[i].store(hot_pread_into(ranges[i].fd, ranges[i].offset, ranges[i].bytes, bufs[i]),
++                               std::memory_order_release);
++            }
++            busy.fetch_sub(1, std::memory_order_release);
++        }
++    }
++};
++
++static int hot_split_reader_count() {
++    const char * e = getenv("LLAMA_HOT_READERS");
++    return e ? std::max(0, atoi(e)) : 3;
++}
++
++static hot_split_readers & hot_split() {
++    static hot_split_readers readers(hot_split_reader_count());
++    return readers;
++}
++
+ struct llama_hot_cache {
+     int                           capacity;
+     float                         bias;
+@@ -276,12 +453,13 @@ struct llama_hot_cache {
+         uint64_t                             tokens = 0;
+         // #185: the admission reads and repacks run on the compute threads,
+         // which would otherwise spin at the barrier while one thread reads.
+-        std::atomic<uint64_t>                round{ 0 };
++        std::atomic<uint64_t>                epoch{ 0 };
++        std::atomic<int>                     arrived{ 0 };
+         std::atomic<size_t>                  next_job{ 0 };
+         std::atomic<size_t>                  jobs_done{ 0 };
+         std::vector<read_job>                shared_jobs;
+-        std::array<uint64_t, 64>             seen{};
+         bool                                 published = false;
++        bool                                 split     = false; // LLAMA_HOT_COOP=2: the readers hold the bytes
+         std::array<int, 256>                 union_old_slots{}, union_indices{};
+         std::vector<int>                     union_experts, union_old_queue;
+         uint64_t                             union_old_tokens = 0;
+@@ -373,23 +551,31 @@ struct llama_hot_cache {
+ 
+     // Every compute thread takes jobs until none are left; thread 0 returns
+     // only once all of them are done, so the next node sees every slot filled.
+-    // A short pause, not a yield: the scheduler takes milliseconds to hand a
+-    // yielded thread its core back, and these waits are tens of microseconds.
+-    static void hot_spin_pause() {
+-#    if defined(__aarch64__) || defined(__arm__)
+-        __asm__ __volatile__("yield" ::: "memory");
+-#    elif defined(__x86_64__) || defined(__i386__)
+-        __asm__ __volatile__("pause" ::: "memory");
+-#    else
+-        std::atomic_thread_fence(std::memory_order_seq_cst);
+-#    endif
++    // Thread 0 publishes this step's jobs only once every thread has arrived,
++    // then bumps the epoch they are waiting on. Reading the epoch before
++    // arriving is what makes it race-free whatever the thread count.
++    static void hot_release_helpers(layer_state & s) {
++        s.arrived.store(0, std::memory_order_relaxed);
++        s.epoch.fetch_add(1, std::memory_order_release);
+     }
+ 
++    static void hot_spin_pause() { hot_cpu_relax(); }
++
+     static void run_shared_jobs(layer_state & s, int ith) {
+         const size_t count = s.shared_jobs.size();
+         for (size_t i = s.next_job.fetch_add(1, std::memory_order_relaxed); i < count;
+              i = s.next_job.fetch_add(1, std::memory_order_relaxed)) {
+-            read_job_one(&s.shared_jobs[i]);
++            const uint64_t j0 = hot_now_ns();
++            if (s.split) {
++                const read_job & job   = s.shared_jobs[i];
++                const size_t     bytes = job.bytes ? job.bytes : job.w->stride;
++                ggml_repack_qt_ms32k4_qt2_r(reinterpret_cast<const block_qt_ms32k4 *>(hot_split().wait(i)),
++                                            reinterpret_cast<block_qt2_r *>(job.repack_dst),
++                                            bytes / sizeof(block_qt_ms32k4));
++            } else {
++                read_job_one(&s.shared_jobs[i]);
++            }
++            hot_atomic_max(g_hot_job_max_ns, hot_now_ns() - j0);
+             s.jobs_done.fetch_add(1, std::memory_order_release);
+         }
+         if (ith == 0) {
+@@ -431,12 +617,21 @@ struct llama_hot_cache {
+         }
+         if (hot_cooperative_reads()) {
+             s.shared_jobs.swap(jobs);
++            s.split = repack && hot_coop_mode() == 2 && hot_split_reader_count() > 0;
++            if (s.split) {
++                std::vector<hot_range> ranges;
++                for (const auto & job : s.shared_jobs) {
++                    ranges.push_back({ job.w->fd, job.offset, job.bytes ? job.bytes : job.w->stride });
++                }
++                hot_split().publish(ranges);
++            }
+             s.next_job.store(0, std::memory_order_relaxed);
+             s.jobs_done.store(0, std::memory_order_relaxed);
+             s.published = true;
+-            s.round.fetch_add(1, std::memory_order_release); // releases the jobs to the other threads
++            hot_release_helpers(s);
++            // The jobs stay put until the next step's arrival: a helper can
++            // still be reading the list after thread 0 sees them all done.
+             run_shared_jobs(s, 0);
+-            jobs.swap(s.shared_jobs);
+         } else {
+             hot_parallel_for(jobs.size(), &jobs, read_job_run);
+         }
+@@ -549,39 +744,48 @@ struct llama_hot_cache {
+     }
+ 
+     static void route_op(ggml_tensor * dst, int ith, int nth, void * ud) {
+-        if (ith) {
+-            if (!hot_cooperative_reads() || (size_t) ith >= static_cast<layer_state *>(ud)->seen.size()) {
++        auto & s = *static_cast<layer_state *>(ud);
++        if (!hot_cooperative_reads()) {
++            if (ith) {
+                 return;
+             }
+-            // Wait for this step's admissions to be published, then take jobs.
+-            auto &         s    = *static_cast<layer_state *>(ud);
+-            const uint64_t mine = s.seen[ith];
+-            while (s.round.load(std::memory_order_acquire) == mine) {
++        } else {
++            const uint64_t mine = s.epoch.load(std::memory_order_acquire);
++            const uint64_t t0   = hot_now_ns();
++            s.arrived.fetch_add(1, std::memory_order_acq_rel);
++            if (ith) {
++                while (s.epoch.load(std::memory_order_acquire) == mine) {
++                    hot_spin_pause();
++                }
++                run_shared_jobs(s, ith);
++                const uint64_t dt = hot_now_ns() - t0;
++                g_hot_helper_ns += dt;
++                hot_atomic_max(g_hot_helper_max_ns, dt);
++                return;
++            }
++            while (s.arrived.load(std::memory_order_acquire) < nth) {
+                 hot_spin_pause();
+             }
+-            s.seen[ith] = mine + 1;
+-            run_shared_jobs(s, ith);
+-            return;
++            const uint64_t dt = hot_now_ns() - t0;
++            g_hot_arrive_ns += dt;
++            hot_atomic_max(g_hot_arrive_max_ns, dt);
+         }
+-        GGML_ASSERT(nth <= 64);
+-        // Whatever this step does, the round is published exactly once: the
+-        // other threads are waiting on it.
+-        struct round_guard {
++        // Whatever this step does, the helpers are released exactly once.
++        struct epoch_guard {
+             layer_state & s;
+-            ~round_guard() {
++            ~epoch_guard() {
+                 if (!s.published && hot_cooperative_reads()) {
+                     s.shared_jobs.clear();
+                     s.next_job.store(0, std::memory_order_relaxed);
+                     s.jobs_done.store(0, std::memory_order_relaxed);
+-                    s.round.fetch_add(1, std::memory_order_release);
++                    hot_release_helpers(s);
+                 }
+                 s.published = false;
+             }
+-        } round_guard_{ *static_cast<layer_state *>(ud) };
++        } epoch_guard_{ s };
+         struct route_timer { uint64_t t0 = hot_now_ns(); ~route_timer() { g_hot_route_ns += hot_now_ns() - t0; g_hot_route_calls++; } } route_timer_;
+         const auto * src = dst->src[0];
+         GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == 256 && ggml_nrows(src) == src->ne[1]);
+-        auto & s = *static_cast<layer_state *>(ud);
+         if (gpu_routing && src->ne[1] == 1) {
+             GGML_ASSERT(src->ne[1] == 1 && s.weights.size() == 3);
+             const auto & gpu = *s.gpu_bridge.state;
+@@ -887,6 +1091,9 @@ void llama_hot_free(llama_hot_cache * cache) {
+     fprintf(stderr, "HOT_GATE decode_admissions=%llu prefill_cold_experts=%llu route_calls=%llu route_ms=%.1f read_ms=%.1f\n",
+             (unsigned long long) g_hot_admissions.load(), (unsigned long long) g_hot_union_cold.load(),
+             (unsigned long long) g_hot_route_calls.load(), g_hot_route_ns.load() / 1e6, g_hot_read_ns.load() / 1e6);
++    fprintf(stderr, "HOT_COOP arrive_ms=%.1f arrive_max_ms=%.2f helper_ms=%.1f helper_max_ms=%.2f job_max_ms=%.2f\n",
++            g_hot_arrive_ns.load() / 1e6, g_hot_arrive_max_ns.load() / 1e6, g_hot_helper_ns.load() / 1e6,
++            g_hot_helper_max_ns.load() / 1e6, g_hot_job_max_ns.load() / 1e6);
+     if (cache) {
+         cache->llama_hot_clear();
+         delete cache;

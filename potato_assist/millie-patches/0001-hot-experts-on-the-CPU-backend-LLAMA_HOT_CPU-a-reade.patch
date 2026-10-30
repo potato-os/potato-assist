@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 16:23:59 +0100
+Subject: [PATCH] hot experts on the CPU backend: LLAMA_HOT_CPU, a reader pool,
+ direct reads (#183)
+
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index f0da1e5..a70386d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -60,6 +60,10 @@ if (BUILD_SHARED_LIBS)
+     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+ endif()
+ 
++option(LLAMA_HOT_CPU "llama: hot-expert cache on the CPU backend (#183 port)" OFF)
++if (GGML_METAL OR LLAMA_HOT_CPU)
++    target_compile_definitions(llama PRIVATE LLAMA_HOT_CACHE)
++endif()
+ if (GGML_METAL)
+     target_compile_definitions(llama PRIVATE LLAMA_HOT_METAL)
+ endif()
+diff --git a/src/llama-hot-cache.cpp b/src/llama-hot-cache.cpp
+index 4d34396..602c052 100644
+--- a/src/llama-hot-cache.cpp
++++ b/src/llama-hot-cache.cpp
+@@ -5,17 +5,23 @@
+ 
+ #include <stdexcept>
+ 
+-#ifdef LLAMA_HOT_METAL
++#ifdef LLAMA_HOT_CACHE
+ #    include "ggml-alloc.h"
+ #    include "ggml-backend.h"
+ #    include "ggml-hot-router.h"
+ #    include "llama-hot-policy.h"
+ #    include "llama-hot-profile.h"
+ 
+-#    include <dispatch/dispatch.h>
+ #    include <fcntl.h>
+-#    include <TargetConditionals.h>
+ #    include <unistd.h>
++#    if defined(__APPLE__)
++#        include <dispatch/dispatch.h>
++#        include <TargetConditionals.h>
++#    else
++#        include <condition_variable>
++#        include <mutex>
++#        include <thread>
++#    endif
+ 
+ #    include <algorithm>
+ #    include <atomic>
+@@ -28,11 +34,166 @@
+ #    include <map>
+ #    include <memory>
+ 
++#    if defined(__APPLE__)
+ static constexpr bool gpu_routing = TARGET_OS_IPHONE;
++#    else
++static constexpr bool gpu_routing = false;
++#    endif
++
++// #183 CPU port. GCD is Apple-only; elsewhere a small persistent pool fans the
++// expert reads out. The caller participates, so a pool of N gives N + 1 readers.
++#    if defined(__APPLE__)
++static void hot_parallel_for(size_t count, void * ctx, void (*fn)(void *, size_t)) {
++    dispatch_apply_f(count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ctx, fn);
++}
++#    else
++struct hot_pool {
++    std::vector<std::thread>  workers;
++    std::mutex                m;
++    std::condition_variable   cv, done_cv;
++    void (*fn)(void *, size_t) = nullptr;
++    void *                    ctx        = nullptr;
++    size_t                    n          = 0;
++    std::atomic<size_t>       next{ 0 }, finished{ 0 };
++    uint64_t                  generation = 0;
++    bool                      stop       = false;
++
++    explicit hot_pool(int threads) {
++        for (int i = 0; i < threads; i++) {
++            workers.emplace_back([this] { loop(); });
++        }
++    }
++
++    ~hot_pool() {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            stop = true;
++        }
++        cv.notify_all();
++        for (auto & t : workers) {
++            t.join();
++        }
++    }
++
++    void work(void (*f)(void *, size_t), void * c, size_t count) {
++        for (size_t i; (i = next.fetch_add(1)) < count;) {
++            f(c, i);
++        }
++        if (finished.fetch_add(1) + 1 == workers.size() + 1) {
++            std::lock_guard<std::mutex> lk(m);
++            done_cv.notify_all();
++        }
++    }
++
++    void loop() {
++        uint64_t seen = 0;
++        for (;;) {
++            void (*f)(void *, size_t);
++            void * c;
++            size_t count;
++            {
++                std::unique_lock<std::mutex> lk(m);
++                cv.wait(lk, [&] { return stop || generation != seen; });
++                if (stop) {
++                    return;
++                }
++                seen  = generation;
++                f     = fn;
++                c     = ctx;
++                count = n;
++            }
++            work(f, c, count);
++        }
++    }
++
++    void run(size_t count, void * c, void (*f)(void *, size_t)) {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            fn       = f;
++            ctx      = c;
++            n        = count;
++            next     = 0;
++            finished = 0;
++            ++generation;
++        }
++        cv.notify_all();
++        work(f, c, count);
++        std::unique_lock<std::mutex> lk(m);
++        done_cv.wait(lk, [&] { return finished.load() == workers.size() + 1; });
++    }
++};
++
++static int hot_pool_threads() {
++    const char * e = getenv("LLAMA_HOT_READERS");
++    return e ? std::max(0, atoi(e)) : 3;
++}
++
++static void hot_parallel_for(size_t count, void * ctx, void (*fn)(void *, size_t)) {
++    static hot_pool pool(hot_pool_threads());
++    pool.run(count, ctx, fn);
++}
++
++// O_DIRECT needs the offset, the length and the buffer aligned to the logical
++// block; GGUF tensor data is only 32-byte aligned, so a direct read covers the
++// enclosing 4 KiB span and the slice is copied out.
++static bool hot_direct_reads() {
++    static const bool direct = getenv("LLAMA_HOT_DIRECT") && atoi(getenv("LLAMA_HOT_DIRECT")) != 0;
++    return direct;
++}
++
++static void hot_pread_exact(int fd, unsigned char * dst, size_t bytes, size_t offset) {
++    if (!hot_direct_reads()) {
++        size_t done = 0;
++        while (done < bytes) {
++            ssize_t n = pread(fd, dst + done, bytes - done, offset + done);
++            if (n < 0 && errno == EINTR) {
++                continue;
++            }
++            if (n <= 0) {
++                GGML_ABORT("hot-cache expert read failed: %s", strerror(errno));
++            }
++            done += n;
++        }
++        posix_fadvise(fd, offset, bytes, POSIX_FADV_DONTNEED);
++        return;
++    }
++    constexpr size_t     align = 4096;
++    const size_t         lo    = offset & ~(align - 1);
++    const size_t         hi    = (offset + bytes + align - 1) & ~(align - 1);
++    thread_local void *  buf   = nullptr;
++    thread_local size_t  cap   = 0;
++    if (cap < hi - lo) {
++        free(buf);
++        if (posix_memalign(&buf, align, hi - lo) != 0) {
++            GGML_ABORT("hot-cache staging allocation failed");
++        }
++        cap = hi - lo;
++    }
++    size_t done = 0;
++    while (done < hi - lo) {
++        ssize_t n = pread(fd, static_cast<unsigned char *>(buf) + done, hi - lo - done, lo + done);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n == 0 && done >= (offset - lo) + bytes) {
++            break; // the aligned span ran past the end of the file; the expert itself is complete
++        }
++        if (n <= 0) {
++            GGML_ABORT("hot-cache direct expert read failed: %s", strerror(errno));
++        }
++        done += n;
++    }
++    memcpy(dst, static_cast<unsigned char *>(buf) + (offset - lo), bytes);
++}
++#    endif
++
+ 
+ static bool metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+     const auto type   = ggml_backend_buffer_get_type(buffer);
+     const auto device = ggml_backend_buft_get_device(type);
++    if (!device) {
++        return false; // a plain host buffer type has no device (#183 port)
++    }
+     const auto reg    = ggml_backend_dev_backend_reg(device);
+     using predicate   = bool (*)(ggml_backend_buffer_t);
+     const auto is_shared =
+@@ -40,6 +201,13 @@ static bool metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+     return is_shared && is_shared(buffer);
+ }
+ 
++static std::atomic<uint64_t> g_hot_admissions{ 0 }, g_hot_union_cold{ 0 }; // #183 gate counters
++static std::atomic<uint64_t> g_hot_route_ns{ 0 }, g_hot_read_ns{ 0 }, g_hot_route_calls{ 0 };
++#    include <chrono>
++static uint64_t hot_now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ struct llama_hot_cache {
+     int                           capacity;
+     float                         bias;
+@@ -89,6 +257,7 @@ struct llama_hot_cache {
+ 
+         void load(weight & w, int expert, int slot) {
+             staging.resize(w.stride);
++#    if defined(__APPLE__)
+             size_t done = 0;
+             while (done < w.stride) {
+                 ssize_t n = pread(w.fd, staging.data() + done, w.stride - done, w.offset + expert * w.stride + done);
+@@ -100,6 +269,9 @@ struct llama_hot_cache {
+                 }
+                 done += n;
+             }
++#    else
++            hot_pread_exact(w.fd, staging.data(), w.stride, w.offset + expert * w.stride);
++#    endif
+             ggml_backend_tensor_set(w.tensor, staging.data(), slot * w.stride, w.stride);
+         }
+     };
+@@ -118,6 +290,10 @@ struct llama_hot_cache {
+         auto &       job   = *static_cast<read_job *>(ctx);
+         size_t       done  = 0;
+         const size_t bytes = job.bytes ? job.bytes : job.w->stride;
++#    if !defined(__APPLE__)
++        hot_pread_exact(job.w->fd, job.data, bytes, job.offset);
++        return;
++#    endif
+         while (done < bytes) {
+             ssize_t n = pread(job.w->fd, job.data + done, bytes - done, job.offset + done);
+             if (n < 0 && errno == EINTR) {
+@@ -140,6 +316,9 @@ struct llama_hot_cache {
+         }
+ 
+         GGML_ASSERT(s.weights.size() == 3 && loads.size() <= 8);
++        g_hot_admissions += loads.size(); // #183 gate counter
++        const uint64_t read_t0 = hot_now_ns();
++        struct read_timer { uint64_t t0; ~read_timer() { g_hot_read_ns += hot_now_ns() - t0; } } read_timer_{ read_t0 };
+         std::vector<read_job> jobs;
+         for (size_t w = 0; w < 3; w++) {
+             auto & weight = *s.weights[w];
+@@ -151,7 +330,7 @@ struct llama_hot_cache {
+                 jobs.push_back({ &weight, dest, weight.offset + loads[i].first * weight.stride });
+             }
+         }
+-        dispatch_apply_f(jobs.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &jobs, read_job_run);
++        hot_parallel_for(jobs.size(), &jobs, read_job_run);
+         for (size_t w = 0; w < 3; w++) {
+             for (size_t i = 0; i < loads.size(); i++) {
+                 auto & weight = *s.weights[w];
+@@ -216,7 +395,8 @@ struct llama_hot_cache {
+             }
+         }
+         if (!jobs.empty()) {
+-            dispatch_apply_f(jobs.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &jobs, read_job_run);
++            g_hot_union_cold += jobs.size() / s.weights.size(); // #183 gate counter
++            hot_parallel_for(jobs.size(), &jobs, read_job_run);
+         }
+     }
+ 
+@@ -254,6 +434,7 @@ struct llama_hot_cache {
+         if (ith) {
+             return;
+         }
++        struct route_timer { uint64_t t0 = hot_now_ns(); ~route_timer() { g_hot_route_ns += hot_now_ns() - t0; g_hot_route_calls++; } } route_timer_;
+         const auto * src = dst->src[0];
+         GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == 256 && ggml_nrows(src) == src->ne[1]);
+         auto & s = *static_cast<layer_state *>(ud);
+@@ -353,9 +534,24 @@ struct llama_hot_cache {
+         if (w->fd < 0) {
+             throw std::runtime_error("dup failed");
+         }
++#    if defined(__APPLE__)
+         if (fcntl(w->fd, F_NOCACHE, 1) < 0) {
+             throw std::runtime_error("could not configure expert reads");
+         }
++#    else
++        if (hot_direct_reads()) {
++            // A dup shares the open-file description with the loader, whose
++            // own reads are unaligned; O_DIRECT needs its own description.
++            char link[64];
++            snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++            const int direct = open(link, O_RDONLY | O_DIRECT | O_CLOEXEC);
++            if (direct < 0) {
++                throw std::runtime_error("could not open the model for direct expert reads");
++            }
++            close(w->fd);
++            w->fd = direct;
++        }
++#    endif
+         GGML_ASSERT(tensor->ne[2] == llama_hot_capacity() && tensor->nb[2] == stride);
+         for (int e : s.policy.queue) {
+             s.load(*w, e, s.policy.slots[e]);
+@@ -378,7 +574,8 @@ struct llama_hot_cache {
+     ggml_tensor * llama_hot_union_weight(ggml_tensor * original, int il) {
+         auto & u = prefill_workspace;
+         auto & s = state(il);
+-        GGML_ASSERT(s.weights.size() == 3 && metal_buffer_is_shared(original->buffer));
++        GGML_ASSERT(s.weights.size() == 3 &&
++                    (ggml_backend_buffer_is_host(original->buffer) || metal_buffer_is_shared(original->buffer)));
+         if (!u.ctx) {
+             ggml_init_params params{ ggml_tensor_overhead() * 4, nullptr, true };
+             u.ctx = ggml_init(params);
+@@ -535,6 +732,9 @@ llama_hot_cache * llama_hot_create(const gguf_context * ctx, int layers, int exp
+ }
+ 
+ void llama_hot_free(llama_hot_cache * cache) {
++    fprintf(stderr, "HOT_GATE decode_admissions=%llu prefill_cold_experts=%llu route_calls=%llu route_ms=%.1f read_ms=%.1f\n",
++            (unsigned long long) g_hot_admissions.load(), (unsigned long long) g_hot_union_cold.load(),
++            (unsigned long long) g_hot_route_calls.load(), g_hot_route_ns.load() / 1e6, g_hot_read_ns.load() / 1e6);
+     if (cache) {
+         cache->llama_hot_clear();
+         delete cache;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a4b74c9..5e746b7 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2992,10 +2992,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+         if (arch != LLM_ARCH_QWEN35MOE || hparams.n_expert != 256 || hparams.n_expert_used != 8) {
+             throw std::runtime_error("hot experts require Qwen3.5 MoE with 256 experts and top-8 routing");
+         }
+-        if (devices.size() != 1 || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[0].dev))) != "MTL") {
+-            throw std::runtime_error("hot experts require a single Metal device");
++        // #183 port: the cache also runs on the CPU backend alone (no GPU device).
++        const bool metal_only = devices.size() == 1 && std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[0].dev))) == "MTL";
++        const bool cpu_only   = devices.empty();
++        if (!metal_only && !cpu_only) {
++            throw std::runtime_error("hot experts require a single Metal device or the CPU alone");
+         }
+-        if (this->n_gpu_layers() < hparams.n_layer || params.no_alloc || (params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern)) {
++        if ((metal_only && this->n_gpu_layers() < hparams.n_layer) || params.no_alloc || (params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern)) {
+             throw std::runtime_error("hot experts require full GPU layer offload and default tensor placement");
+         }
+         hot_cache = llama_hot_create(ml.metadata, hparams.n_layer, hparams.n_expert, params.hot_experts, params.hot_expert_bias);
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 07198fb..7196048 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -1,4 +1,7 @@
+ #include <algorithm>
++
++static int   g_hot_experts     = 0;    // #183 scratch
++static float g_hot_expert_bias = 1.0f;
+ #include <array>
+ #include <cassert>
+ #include <chrono>
+@@ -451,6 +454,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
+     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
++    printf("  --hot-experts <n>, --hot-expert-bias <f>    (default: 0, 1.0; #183 scratch, one value each)\n");
+     printf("  -fa, --flash-attn <0|1>                     (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
+     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
+     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
+@@ -765,6 +769,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                     break;
+                 }
+                 params.main_gpu = parse_int_range(argv[i]);
++            } else if (arg == "--hot-experts") {
++                if (++i >= argc) {
++                    invalid_param = true;
++                    break;
++                }
++                g_hot_experts = std::stoi(argv[i]);
++            } else if (arg == "--hot-expert-bias") {
++                if (++i >= argc) {
++                    invalid_param = true;
++                    break;
++                }
++                g_hot_expert_bias = std::stof(argv[i]);
+             } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1163,6 +1179,8 @@ struct cmd_params_instance {
+         mparams.use_mmap      = use_mmap;
+         mparams.use_direct_io = use_direct_io;
+         mparams.no_host       = no_host;
++        mparams.hot_experts     = g_hot_experts;
++        mparams.hot_expert_bias = g_hot_expert_bias;
+ 
+         if (n_cpu_moe <= 0) {
+             if (tensor_buft_overrides.empty()) {

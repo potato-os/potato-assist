@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jan <1760229+slomin@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:23:47 +0100
+Subject: [PATCH] ggml: QT2_R4 validates in its own layout (#190 review)
+
+ggml_validate_row_data walked QT2_R4 with QT2_R's stride, reading
+payload bytes as super-scales and skipping three rows' of them. It now
+walks whole groups of four rows and checks each row's super-scale. The
+type keeps no to_float: a row's bytes are spread over its group, so no
+single-row conversion exists.
+
+test-millie-qt2r checks repacked slots validate and an inf in a fourth
+row's super-scale is caught (the old check missed it).
+
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index dc2ca2a..05b062e 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -6298,8 +6298,20 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+             VALIDATE_ROW_DATA_D_F16_IMPL(block_qt2_r, data, nb);
+         } break;
+         case GGML_TYPE_QT2_R4: {
+-            // interleaved rows: the super-scales are four per block of four row-blocks
+-            VALIDATE_ROW_DATA_D_F16_IMPL(block_qt2_r, data, nb);
++            // nb counts row shares; a block holds four, the rows interleaved,
++            // so only whole groups of four rows validate
++            if (nb % 4 != 0) {
++                fprintf(stderr, "%s: qt2_r4 data of %zu row blocks is not whole groups of four\n", __func__, nb);
++                return false;
++            }
++            const block_qt2_r4 * q = (const block_qt2_r4 *) data;
++            for (size_t i = 0; i < nb / 4; ++i) {
++                for (int r = 0; r < 4; ++r) {
++                    if (!validate_fp16(q[i].d[r], i)) {
++                        return false;
++                    }
++                }
++            }
+         } break;
+         case GGML_TYPE_QT_MS32K4: {
+             VALIDATE_ROW_DATA_D_F16_IMPL(block_qt_ms32k4, data, nb);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 2ae98ec..15e42af 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -746,6 +746,9 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .blck_size                = QKT_MS32K,
+         .type_size                = sizeof(block_qt2_r),
+         .is_quantized             = true,
++        // no to_float / from_float_ref: a row's bytes are spread over its
++        // group of four, so no single-row conversion exists; the hot-expert
++        // slots of this type are only ever multiplied
+     },
+     [GGML_TYPE_Q4_SYM16F] = {
+         .type_name = "q4_sym16f",
+diff --git a/tests/test-millie-qt2r.cpp b/tests/test-millie-qt2r.cpp
+index 2544d23..ba2a7ef 100644
+--- a/tests/test-millie-qt2r.cpp
++++ b/tests/test-millie-qt2r.cpp
+@@ -102,6 +102,15 @@ int main() {
+         snprintf(what, sizeof(what), "qt2_r4 %lldx%lld repack, both routes", (long long) k, (long long) m);
+         ok &= same(x4, x5, what);
+ 
++        // every row's super-scale is checked: an inf in the fourth is caught
++        std::vector<uint8_t> bad((const uint8_t *) x4->data, (const uint8_t *) x4->data + ggml_nbytes(x4));
++        ((block_qt2_r4 *) bad.data())->d[3] = 0x7c00;
++        const bool valid = ggml_validate_row_data(GGML_TYPE_QT2_R4, x4->data, ggml_nbytes(x4)) &&
++                           !ggml_validate_row_data(GGML_TYPE_QT2_R4, bad.data(), bad.size());
++        snprintf(what, sizeof(what), "qt2_r4 %lldx%lld validate_row_data", (long long) k, (long long) m);
++        printf("%-44s %s\n", what, valid ? "valid" : "INVALID");
++        ok &= valid;
++
+         ggml_tensor * v1 = ggml_view_2d(ctx, x1, k, m, x1->nb[1], 0);
+         ggml_tensor * v4 = ggml_view_2d(ctx, x4, k, m, x4->nb[1], 0);
+         for (int64_t n : { 1, 2, 3, 4, 5, 8, 17, 64, 129 }) {
